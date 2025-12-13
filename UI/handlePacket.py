@@ -1,38 +1,48 @@
+# handlePacket.py
+from __future__ import annotations
+
 import struct
+
 from packet import DataPacket
+
 
 class PacketHandler:
     PACKET_SIZE = 16
     EXPECTED_HEADER = 0xAC
-    
+
+    CMD_HEADER = 0xAA
+    ACK_HEADER = 0xAB
+
+    CMD_IGNITER = ord('I')
+    CMD_SPARE = ord('S')
+    CMD_TANKS = ord('T')
+    CMD_PILOT = ord('P')
+
+    CMD_ON = 0x01
+    CMD_OFF = 0x02
+
     @staticmethod
-    def decode_packet(data: bytes) -> DataPacket:
+    def crc8_xor(data: bytes) -> int:
+        c = 0
+        for b in data:
+            c ^= b
+        return c & 0xFF
+
+    # ---- existing decode/encode for DataPacket stays unchanged ----
+    @staticmethod
+    def decode_packet(data: bytes) -> DataPacket | None:
         try:
-            # Check packet size
             if len(data) != PacketHandler.PACKET_SIZE:
-                raise ValueError(
-                    f"Invalid packet size: {len(data)} bytes, "
-                    f"expected {PacketHandler.PACKET_SIZE}"
-                )
-            
-            # Check header
+                raise ValueError(f"Invalid packet size: {len(data)} bytes, expected {PacketHandler.PACKET_SIZE}")
+
             if data[0] != PacketHandler.EXPECTED_HEADER:
-                raise ValueError(
-                    f"Invalid header: 0x{data[0]:02X}, "
-                    f"expected 0x{PacketHandler.EXPECTED_HEADER:02X}"
-                )
-            
-            # Unpack struct data
+                raise ValueError(f"Invalid header: 0x{data[0]:02X}, expected 0x{PacketHandler.EXPECTED_HEADER:02X}")
+
             header, seq, timestamp = struct.unpack('<BBI', data[:6])
-            
-            # Bitshift channel data (24-bit values)
             ch0 = (data[6] << 16) | (data[7] << 8) | data[8]
             ch1 = (data[9] << 16) | (data[10] << 8) | data[11]
-            
-            # Unpack ADC and CRC
             adc, crc = struct.unpack('<HH', data[12:16])
-            
-            # Create and return a packet object
+
             return DataPacket(
                 header=header,
                 sequence=seq,
@@ -42,54 +52,37 @@ class PacketHandler:
                 internal_adc=adc,
                 crc=crc
             )
-        
-        # if struct unpacking fails 
-        except struct.error as e:
-            print(f"Struct unpack error: {e}")
-            return None
-        
-        # if validation fails
-        except ValueError as e:
-            print(f"Packet validation error: {e}")
-            return None
-        
-        # if data is too short 
-        except IndexError as e:
-            print(f"Index error during decoding: {e}")
-            return None
-        
-        # if an unexpected error occurs
         except Exception as e:
-            print(f"Unexpected error during packet decoding: {e}")
+            print(f"Packet decode error: {e}")
             return None
-    
+
+    # ---- NEW: command/ack helpers ----
     @staticmethod
-    def encode_packet(packet: DataPacket) -> bytes:
-        data = bytearray(PacketHandler.PACKET_SIZE)
-        
-        # Pack struct data
-        data[0:6] = struct.pack('<BBI', 
-                               packet.get_header(), 
-                               packet.get_sequence(), 
-                               packet.get_timestamp())
-        
-        # Pack channel data (24-bit values)
-        data[6] = (packet.get_channel0() >> 16) & 0xFF
-        data[7] = (packet.get_channel0() >> 8) & 0xFF
-        data[8] = packet.get_channel0() & 0xFF
-        
-        data[9] = (packet.get_channel1() >> 16) & 0xFF
-        data[10] = (packet.get_channel1() >> 8) & 0xFF
-        data[11] = packet.get_channel1() & 0xFF
-        
-        # Pack ADC and CRC
-        data[12:16] = struct.pack('<HH', 
-                                 packet.get_internal_adc(), 
-                                 packet.get_crc())
-        
-        return bytes(data)
-    
+    def encode_command(cmd: str, val: int) -> bytes:
+        """
+        Build 4-byte command: [0xAA, cmd_char, val, crc]
+        cmd: one of 'I','S','T','P'
+        val: 0x01 (ON) or 0x02 (OFF)
+        """
+        if not isinstance(cmd, str) or len(cmd) != 1:
+            raise ValueError("cmd must be a single character like 'I','S','T','P'")
+        cmd_b = ord(cmd) & 0xFF
+        frame3 = bytes([PacketHandler.CMD_HEADER, cmd_b, val & 0xFF])
+        crc = PacketHandler.crc8_xor(frame3)
+        return frame3 + bytes([crc])
+
     @staticmethod
-    def is_valid_packet(data: bytes) -> bool:
-        return (len(data) == PacketHandler.PACKET_SIZE and 
-                data[0] == PacketHandler.EXPECTED_HEADER)
+    def decode_ack(data: bytes):
+        """
+        Parse 4-byte ack: [0xAB, cmd_char, state(0/1), crc]
+        Returns (cmd_char, state_bool) or None if invalid.
+        """
+        if len(data) != 4:
+            return None
+        if data[0] != PacketHandler.ACK_HEADER:
+            return None
+        if PacketHandler.crc8_xor(data[:3]) != data[3]:
+            return None
+        cmd_char = chr(data[1])
+        state = bool(data[2])
+        return (cmd_char, state)

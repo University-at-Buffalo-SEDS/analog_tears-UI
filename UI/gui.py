@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Optional
+from typing import Optional, Callable
 
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
@@ -14,6 +14,8 @@ class MainWindow(QtWidgets.QMainWindow):
             *,
             history: int = 5000,
             initial_window_seconds: float = 10.0,
+            # Pass a function that sends commands, e.g. radio.send_command
+            send_command: Optional[Callable[[str, bool], object]] = None,
             parent=None,
     ):
         super().__init__(parent)
@@ -22,6 +24,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._paused = False
         self._history = history
         self._window_seconds = float(initial_window_seconds)
+
+        # Hook for sending commands (Radio.send_command)
+        self._send_command = send_command
 
         # Data buffers
         self._xs = deque(maxlen=history)
@@ -87,6 +92,39 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addStretch(1)
 
         # --------------------
+        # Commands row
+        # --------------------
+        cmd_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(cmd_row)
+
+        cmd_row.addWidget(QtWidgets.QLabel("Commands:"))
+
+        # Helper to create ON/OFF button pairs
+        def add_cmd_buttons(label: str, cmd_char: str):
+            box = QtWidgets.QGroupBox(label)
+            box_l = QtWidgets.QHBoxLayout(box)
+            on_btn = QtWidgets.QPushButton("ON")
+            off_btn = QtWidgets.QPushButton("OFF")
+
+            on_btn.clicked.connect(lambda: self._do_send_command(cmd_char, True))
+            off_btn.clicked.connect(lambda: self._do_send_command(cmd_char, False))
+
+            box_l.addWidget(on_btn)
+            box_l.addWidget(off_btn)
+            cmd_row.addWidget(box)
+
+        add_cmd_buttons("Igniter (I)", "I")
+        add_cmd_buttons("Pilot (P)", "P")
+        add_cmd_buttons("Tanks (T)", "T")
+        add_cmd_buttons("Spare (S)", "S")
+
+        cmd_row.addStretch(1)
+
+        self.cmd_status_lbl = QtWidgets.QLabel("ACK: —")
+        self.cmd_status_lbl.setMinimumWidth(260)
+        cmd_row.addWidget(self.cmd_status_lbl)
+
+        # --------------------
         # Plots
         # --------------------
         pg.setConfigOptions(antialias=True)
@@ -108,9 +146,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_max_labels()
 
     # --------------------
+    # Command sending
+    # --------------------
+    def _do_send_command(self, cmd: str, on: bool) -> None:
+        if self._send_command is None:
+            self.cmd_status_lbl.setText("ACK: no radio hooked up")
+            return
+
+        # WARNING: this blocks up to ACK timeout. If you want non-blocking,
+        # we can move to a QThread + signal.
+        try:
+            ack = self._send_command(cmd, on)
+            # ack from our Radio is typically (cmd_char, state_bool) or None
+            if ack is None:
+                self.cmd_status_lbl.setText(f"ACK: {cmd} {'ON' if on else 'OFF'} (no ack)")
+            else:
+                a_cmd, a_state = ack
+                self.cmd_status_lbl.setText(f"ACK: {a_cmd} {'ON' if a_state else 'OFF'}")
+        except Exception as e:
+            self.cmd_status_lbl.setText(f"ACK: error ({e})")
+
+    # --------------------
     # UI callbacks
     # --------------------
-
     def _on_pause_toggled(self, checked: bool) -> None:
         self._paused = checked
         self.pause_btn.setText("Resume" if checked else "Pause")
@@ -135,7 +193,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # --------------------
     # Window logic
     # --------------------
-
     def _trim_time_window(self) -> None:
         if not self._xs:
             return
@@ -178,7 +235,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # --------------------
     # Data entry
     # --------------------
-
     @QtCore.pyqtSlot(float, int, int, int)
     def on_sample(self, t_seconds: float, ch0: int, ch1: int, internal_adc: int) -> None:
         if self._paused:

@@ -9,8 +9,8 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtWidgets
 
-from radio import Radio
 from gui import MainWindow
+from radio import Radio
 
 
 class RadioWorker(QtCore.QThread):
