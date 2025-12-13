@@ -30,9 +30,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Data buffers
         self._xs = deque(maxlen=history)
-        self._ch0 = deque(maxlen=history)
-        self._ch1 = deque(maxlen=history)
-        self._iadc = deque(maxlen=history)
+        self._ch0 = deque(maxlen=history)   # float
+        self._ch1 = deque(maxlen=history)   # float
+        self._iadc = deque(maxlen=history)  # int
 
         self._max_ch0: Optional[float] = None
         self._max_ch1: Optional[float] = None
@@ -153,11 +153,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmd_status_lbl.setText("ACK: no radio hooked up")
             return
 
-        # WARNING: this blocks up to ACK timeout. If you want non-blocking,
-        # we can move to a QThread + signal.
         try:
             ack = self._send_command(cmd, on)
-            # ack from our Radio is typically (cmd_char, state_bool) or None
             if ack is None:
                 self.cmd_status_lbl.setText(f"ACK: {cmd} {'ON' if on else 'OFF'} (no ack)")
             else:
@@ -207,18 +204,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._xs:
             self._max_ch0 = self._max_ch1 = self._max_iadc = None
             return
-        self._max_ch0 = max(self._ch0)
-        self._max_ch1 = max(self._ch1)
-        self._max_iadc = max(self._iadc)
+        self._max_ch0 = max(self._ch0) if self._ch0 else None
+        self._max_ch1 = max(self._ch1) if self._ch1 else None
+        self._max_iadc = max(self._iadc) if self._iadc else None
 
     def _update_max_labels(self) -> None:
-        def fmt(v: Optional[float]) -> str:
-            return "—" if v is None else f"{v:.0f}"
+        def fmt_f(v: Optional[float]) -> str:
+            return "—" if v is None else f"{v:.3f}"
+
+        def fmt_i(v: Optional[float]) -> str:
+            return "—" if v is None else f"{int(v)}"
 
         ws = int(self._window_seconds)
-        self.max_ch0_lbl.setText(f"Max Ch0 ({ws}s): {fmt(self._max_ch0)}")
-        self.max_ch1_lbl.setText(f"Max Ch1 ({ws}s): {fmt(self._max_ch1)}")
-        self.max_iadc_lbl.setText(f"Max Internal ADC ({ws}s): {fmt(self._max_iadc)}")
+        self.max_ch0_lbl.setText(f"Max Ch0 ({ws}s): {fmt_f(self._max_ch0)}")
+        self.max_ch1_lbl.setText(f"Max Ch1 ({ws}s): {fmt_f(self._max_ch1)}")
+        self.max_iadc_lbl.setText(f"Max Internal ADC ({ws}s): {fmt_i(self._max_iadc)}")
 
     def _redraw(self) -> None:
         xs = list(self._xs)
@@ -235,15 +235,15 @@ class MainWindow(QtWidgets.QMainWindow):
     # --------------------
     # Data entry
     # --------------------
-    @QtCore.pyqtSlot(float, int, int, int)
-    def on_sample(self, t_seconds: float, ch0: int, ch1: int, internal_adc: int) -> None:
+    @QtCore.pyqtSlot(float, float, float, int)
+    def on_sample(self, t_seconds: float, ch0: float, ch1: float, internal_adc: int) -> None:
         if self._paused:
             return
 
-        self._xs.append(t_seconds)
-        self._ch0.append(ch0)
-        self._ch1.append(ch1)
-        self._iadc.append(internal_adc)
+        self._xs.append(float(t_seconds))
+        self._ch0.append(float(ch0))
+        self._ch1.append(float(ch1))
+        self._iadc.append(int(internal_adc))
 
         self._trim_time_window()
         self._recompute_window_maxes()

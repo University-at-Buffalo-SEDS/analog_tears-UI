@@ -18,7 +18,8 @@ class RadioWorker(QtCore.QThread):
     Background serial read loop.
     Emits values to GUI and logs to CSV.
     """
-    sample = QtCore.pyqtSignal(float, int, int, int)  # t_seconds, ch0, ch1, internal_adc
+    # t_seconds, ch0(float), ch1(float), internal_adc(int)
+    sample = QtCore.pyqtSignal(float, float, float, int)
     status = QtCore.pyqtSignal(str)
 
     def __init__(self, *, com_port: str, csv_filename: str, parent=None):
@@ -59,7 +60,12 @@ class RadioWorker(QtCore.QThread):
                     # GUI update
                     try:
                         t = time.monotonic() - t0
-                        self.sample.emit(t, packet.channel0, packet.channel1, packet.internal_adc)
+                        self.sample.emit(
+                            float(t),
+                            float(packet.channel0),
+                            float(packet.channel1),
+                            int(packet.internal_adc),
+                        )
                     except Exception as e:
                         self.status.emit(f"Emit error: {e}")
 
@@ -77,6 +83,8 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
 
+    # Pass send_command if you want buttons enabled:
+    # worker/radio wiring would need a thread-safe command path (we can do that next).
     win = MainWindow(history=2000)
     win.resize(1100, 800)
     win.show()

@@ -6,8 +6,8 @@ class DataPacket:
     header: int
     sequence: int
     timestamp: int
-    channel0: int
-    channel1: int
+    channel0: float
+    channel1: float
     internal_adc: int
     crc: int
 
@@ -31,10 +31,10 @@ class DataPacket:
     def get_timestamp(self) -> int:
         return self.timestamp
 
-    def get_channel0(self) -> int:
+    def get_channel0(self) -> float:
         return self.channel0
 
-    def get_channel1(self) -> int:
+    def get_channel1(self) -> float:
         return self.channel1
 
     def get_internal_adc(self) -> int:
@@ -43,7 +43,7 @@ class DataPacket:
     def get_crc(self) -> int:
         return self.crc
 
-    def get_all_data(self) -> tuple[int, int, int, int, int, int, int]:
+    def get_all_data(self) -> tuple[int, int, int, float, float, int, int]:
         return (self.header, self.sequence, self.timestamp,
                 self.channel0, self.channel1, self.internal_adc, self.crc)
 

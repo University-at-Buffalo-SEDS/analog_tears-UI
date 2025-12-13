@@ -27,7 +27,7 @@ class Radio:
             *,
             sim_rate_hz: float = 50.0,
             sim_seed: Optional[int] = None,
-            serial_timeout: float = 1.0,
+            serial_timeout: float = 0.05,  # shorter helps buffer-based parsing
     ):
         self.port = port
         self.baudrate = baudrate
@@ -41,10 +41,12 @@ class Radio:
         self._last_sim_time = 0.0
         self._sim_seq = 0
 
+        # RX buffer for real serial
+        self._rx_buf = bytearray()
+
         if not self.simulate:
-            # IMPORTANT: timeout governs read() calls (including ACK waits)
+            # timeout governs read() calls (including ACK waits)
             self.ser = serial.Serial(port, baudrate, timeout=serial_timeout)
-            # clear any stale bytes
             try:
                 self.ser.reset_input_buffer()
                 self.ser.reset_output_buffer()
@@ -70,19 +72,23 @@ class Radio:
             return None
 
         self._last_sim_time = now
-        self._sim_seq += 1
+        self._sim_seq = (self._sim_seq + 1) & 0xFF  # keep it byte-like if you want
 
-        ch0 = self._rng.randint(0, 4095)
-        ch1 = self._rng.randint(0, 4095)
+        # Simulate float channels (adjust ranges as desired)
+        ch0 = self._rng.uniform(-1.0, 1.0)
+        ch1 = self._rng.uniform(-1.0, 1.0)
+
         iadc = self._rng.randint(0, 1023)
-        crc = (ch0 ^ ch1 ^ iadc ^ self._sim_seq) & 0xFFFF
+
+        # CRC here is just dummy; your real CRC is in-packet.
+        crc = (int(ch0 * 1000) ^ int(ch1 * 1000) ^ iadc ^ self._sim_seq) & 0xFFFF
 
         return DataPacket(
             header=0xAC,
             sequence=self._sim_seq,
             timestamp=int(now * 1000),
-            channel0=ch0,
-            channel1=ch1,
+            channel0=float(ch0),
+            channel1=float(ch1),
             internal_adc=iadc,
             crc=crc,
         )
@@ -90,6 +96,30 @@ class Radio:
     # -------------------------
     # RX: telemetry packets
     # -------------------------
+
+    def _pull_serial_bytes(self) -> None:
+        """Read whatever is available and append to the RX buffer."""
+        if not self.ser:
+            return
+
+        # Prefer non-blocking-ish reads if supported by pyserial
+        try:
+            n = self.ser.in_waiting
+        except Exception:
+            n = 0
+
+        if n and n > 0:
+            chunk = self.ser.read(n)
+        else:
+            # fall back to reading at least 1 byte (uses timeout)
+            chunk = self.ser.read(1)
+
+        if chunk:
+            self._rx_buf += chunk
+
+        # keep buffer bounded
+        if len(self._rx_buf) > 4096:
+            self._rx_buf = self._rx_buf[-4096:]
 
     def read_packet(self) -> Optional[DataPacket]:
         if self.simulate:
@@ -99,14 +129,47 @@ class Radio:
             raise ConnectionError("Not connected to serial port")
 
         try:
-            data = self.ser.read(PacketHandler.PACKET_SIZE)
-            if len(data) == 0:
+            self._pull_serial_bytes()
+
+            if not self._rx_buf:
                 return None
-            if len(data) < PacketHandler.PACKET_SIZE:
-                # If you want, you can buffer and resync instead of dropping.
-                print(f"Warning: Incomplete packet ({len(data)} bytes)")
+
+            hdr = bytes([PacketHandler.EXPECTED_HEADER])
+            idx = self._rx_buf.find(hdr)
+            if idx == -1:
+                # No header found; drop old junk
+                self._rx_buf.clear()
                 return None
-            return PacketHandler.decode_packet(data)
+
+            # Drop anything before the header (resync)
+            if idx > 0:
+                del self._rx_buf[:idx]
+
+            # Need full packet
+            if len(self._rx_buf) < PacketHandler.PACKET_SIZE:
+                return None
+
+            frame = bytes(self._rx_buf[:PacketHandler.PACKET_SIZE])
+            del self._rx_buf[:PacketHandler.PACKET_SIZE]
+
+            pkt = PacketHandler.decode_packet(frame)
+            if pkt is None:
+                # If decode failed, try to resync by dropping one byte
+                if self._rx_buf:
+                    del self._rx_buf[0:1]
+                return None
+
+            # If your PacketHandler currently decodes ch0/ch1 as uint32 but you
+            # intend them to be float32, you should change PacketHandler to unpack
+            # '<BBIffHH' and then this conversion is unnecessary.
+            # Otherwise, if pkt.channel0/pkt.channel1 might still be ints, convert:
+            try:
+                pkt.channel0 = float(pkt.channel0)  # type: ignore[attr-defined]
+                pkt.channel1 = float(pkt.channel1)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+            return pkt
 
         except Exception as e:
             print(f"Error reading from serial port: {e}")
@@ -134,7 +197,6 @@ class Radio:
         Returns (cmd_char, state_bool) on ACK, or None on timeout/no-ack.
         """
         if self.simulate:
-            # Nothing real to do; pretend it succeeded.
             return (cmd, on) if wait_ack else None
 
         if not self.is_connected():
@@ -143,14 +205,12 @@ class Radio:
         val = PacketHandler.CMD_ON if on else PacketHandler.CMD_OFF
         frame = PacketHandler.encode_command(cmd, val)
 
-        # Write the 4-byte command
         self.ser.write(frame)
         self.ser.flush()
 
         if not wait_ack:
             return None
 
-        # Wait for a 4-byte ACK frame, scanning the stream for 0xAB
         deadline = time.monotonic() + max(0.0, ack_timeout_s)
         buf = bytearray()
 
@@ -160,11 +220,9 @@ class Radio:
                 continue
             buf += chunk
 
-            # Keep buffer from growing forever
             if len(buf) > 32:
                 buf = buf[-32:]
 
-            # Try to find an ACK header and parse 4 bytes from there
             idx = buf.find(bytes([PacketHandler.ACK_HEADER]))
             if idx == -1:
                 continue
@@ -176,7 +234,6 @@ class Radio:
             if parsed is not None:
                 return parsed
 
-            # If it looked like an ACK header but failed CRC, skip past it
             buf = buf[idx + 1:]
 
         return None

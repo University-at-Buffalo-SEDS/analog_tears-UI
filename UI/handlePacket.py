@@ -7,7 +7,7 @@ from packet import DataPacket
 
 
 class PacketHandler:
-    PACKET_SIZE = 16
+    PACKET_SIZE = 18
     EXPECTED_HEADER = 0xAC
 
     CMD_HEADER = 0xAA
@@ -28,20 +28,22 @@ class PacketHandler:
             c ^= b
         return c & 0xFF
 
-    # ---- existing decode/encode for DataPacket stays unchanged ----
     @staticmethod
     def decode_packet(data: bytes) -> DataPacket | None:
         try:
             if len(data) != PacketHandler.PACKET_SIZE:
-                raise ValueError(f"Invalid packet size: {len(data)} bytes, expected {PacketHandler.PACKET_SIZE}")
+                raise ValueError(
+                    f"Invalid packet size: {len(data)} bytes, expected {PacketHandler.PACKET_SIZE}"
+                )
 
             if data[0] != PacketHandler.EXPECTED_HEADER:
-                raise ValueError(f"Invalid header: 0x{data[0]:02X}, expected 0x{PacketHandler.EXPECTED_HEADER:02X}")
+                raise ValueError(
+                    f"Invalid header: 0x{data[0]:02X}, expected 0x{PacketHandler.EXPECTED_HEADER:02X}"
+                )
 
-            header, seq, timestamp = struct.unpack('<BBI', data[:6])
-            ch0 = (data[6] << 16) | (data[7] << 8) | data[8]
-            ch1 = (data[9] << 16) | (data[10] << 8) | data[11]
-            adc, crc = struct.unpack('<HH', data[12:16])
+            # Layout (little-endian):
+            # [header:u8][seq:u8][timestamp:u32][ch0:u32][ch1:u32][adc:u16][crc:u16]
+            header, seq, timestamp, ch0, ch1, adc, crc = struct.unpack("<BBIIIHH", data)
 
             return DataPacket(
                 header=header,
@@ -50,20 +52,15 @@ class PacketHandler:
                 channel0=ch0,
                 channel1=ch1,
                 internal_adc=adc,
-                crc=crc
+                crc=crc,
             )
         except Exception as e:
             print(f"Packet decode error: {e}")
             return None
 
-    # ---- NEW: command/ack helpers ----
+    # ---- command/ack helpers unchanged ----
     @staticmethod
     def encode_command(cmd: str, val: int) -> bytes:
-        """
-        Build 4-byte command: [0xAA, cmd_char, val, crc]
-        cmd: one of 'I','S','T','P'
-        val: 0x01 (ON) or 0x02 (OFF)
-        """
         if not isinstance(cmd, str) or len(cmd) != 1:
             raise ValueError("cmd must be a single character like 'I','S','T','P'")
         cmd_b = ord(cmd) & 0xFF
@@ -73,10 +70,6 @@ class PacketHandler:
 
     @staticmethod
     def decode_ack(data: bytes):
-        """
-        Parse 4-byte ack: [0xAB, cmd_char, state(0/1), crc]
-        Returns (cmd_char, state_bool) or None if invalid.
-        """
         if len(data) != 4:
             return None
         if data[0] != PacketHandler.ACK_HEADER:
@@ -85,4 +78,4 @@ class PacketHandler:
             return None
         cmd_char = chr(data[1])
         state = bool(data[2])
-        return (cmd_char, state)
+        return cmd_char, state
