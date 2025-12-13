@@ -75,8 +75,8 @@ class Radio:
         self._sim_seq = (self._sim_seq + 1) & 0xFF  # keep it byte-like if you want
 
         # Simulate float channels (adjust ranges as desired)
-        ch0 = self._rng.uniform(-1.0, 1.0)
-        ch1 = self._rng.uniform(-1.0, 1.0)
+        ch0 = self._rng.uniform(0.0, 1000.0)
+        ch1 = self._rng.uniform(0.0, 1000.0)
 
         iadc = self._rng.randint(0, 1023)
 
