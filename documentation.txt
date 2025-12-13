@@ -1,0 +1,20 @@
+Format String
+'<'  ~ read LSB first
+'B'  ~ uint8_t header (1B) --> C: unsigned char --> Python: integer
+'B'  ~ uint8_t sequence (1B) --> C: unsigned char --> Python: integer
+'I'  ~ uint32_t timestamp (4B) --> C: unsigned int --> Python: integer
+     ~ uint8_t ad7193_data[2][3] 
+'H'  ~ uint16_t stm32_adc (2B) --> C: unsigned short --> Python: integer
+'H'  ~ uint16_t crc (2B) --> C: unsigned short --> Python: integer
+
+Byte:   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+         ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+  Data:  │ AC │Seq │  Timestamp (4B)   │Ch0 MSB│Ch0 │Ch0 │Ch1 MSB│Ch1 │Ch1 │ADC LSB│ADC MSB│CRC LSB│CRC MSB│
+         └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+         │<───────────── 6 bytes ────────────>│<────── 6 bytes ─────>│< 2 bytes >│< 2 bytes >│
+         │  struct.unpack('<BBI')             │ 24-bit channels      │ internal  │ CRC-16    │
+         │  header, seq, timestamp            │ ch0, ch1             │ ADC       │ checksum  │
+
+
+Exceptions
+when you return None, it dosen't break the code, simply prints out the error message and keeps rolling 
