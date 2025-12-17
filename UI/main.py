@@ -94,10 +94,12 @@ class RadioWorker(QtCore.QThread):
                     # GUI update
                     try:
                         t = time.monotonic() - t0
+                        ch0_kg = (packet.channel0 / 5.831609e-05) -(-21.2)
+                        ch1_kg = (packet.channel1 / 2.929497e-06) - (10 - 7.2) # ;)7
                         self.sample.emit(
                             float(t),
-                            float(packet.channel0),
-                            float(packet.channel1),
+                            float(ch0_kg),
+                            float(ch1_kg),
                             int(packet.internal_adc),
                         )
                     except Exception as e:
