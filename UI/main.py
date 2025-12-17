@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Deque, Tuple
+from typing import Optional, Deque
 
 from PyQt6 import QtCore, QtWidgets
 
@@ -189,6 +189,9 @@ class RadioWorker(QtCore.QThread):
     def run(self) -> None:
         last_status = ""
         t0 = time.monotonic()
+        seen_igniter_command = False
+        turn_p_off = False
+        p_start = time.monotonic()
 
         try:
             while not self._stop:
@@ -216,7 +219,18 @@ class RadioWorker(QtCore.QThread):
                 if isinstance(ev, tuple):
                     cmd, state = ev
                     self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
+                    if cmd == "I":
+                        seen_igniter_command = True
+
+                    if seen_igniter_command and cmd == "P" and state == True:
+                        turn_p_off = True
+                        p_start = time.monotonic()
                     continue
+
+                if turn_p_off and time.monotonic() - p_start > 1.5:
+                    self.send_command("P", False)
+                    seen_igniter_command = False
+                    turn_p_off = False
 
                 # --- telemetry packet ---
                 packet = ev
