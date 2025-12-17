@@ -12,7 +12,7 @@ class DataPacket:
     crc: int
 
     def __init__(self, header=0xAC, sequence=0, timestamp=0,
-                 channel0=0, channel1=0, internal_adc=0, crc=0):
+                 channel0=0.0, channel1=0.0, internal_adc=0, crc=0):
         self.header = header
         self.sequence = sequence
         self.timestamp = timestamp

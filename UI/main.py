@@ -27,12 +27,12 @@ class RadioWorker(QtCore.QThread):
         self._com_port = com_port
         self._csv_filename = csv_filename
         self._stop = False
+        self.radio = Radio(port=self._com_port)
 
     def stop(self) -> None:
         self._stop = True
 
     def run(self) -> None:
-        radio = Radio(port=self._com_port)
         csv_path = Path(self._csv_filename)
 
         self.status.emit(f"Logging to {csv_path.resolve()}")
@@ -41,14 +41,49 @@ class RadioWorker(QtCore.QThread):
         try:
             with open(csv_path, "w", newline="") as file:
                 writer = csv.writer(file)
-                writer.writerow(["Rx_Timestamp", "Header", "Seq", "Timestamp", "Ch0", "Ch1", "Internal ADC", "CRC"])
+                writer.writerow([
+                    "Rx_Timestamp",
+                    "Header",
+                    "Seq",
+                    "Timestamp",
+                    "Ch0",
+                    "Ch1",
+                    "Internal ADC",
+                    "CRC",
+                ])
+
+                last_status = ""
 
                 while not self._stop:
-                    packet = radio.read_packet()
-                    if not packet:
-                        self.msleep(1)
+                    # --- connection management ---
+                    if not self.radio.is_connected():
+                        ok = self.radio.reconnect()
+                        new_status = "Reconnected" if ok else "Disconnected (retrying...)"
+                        if new_status != last_status:
+                            self.status.emit(new_status)
+                            last_status = new_status
+                        time.sleep(0.25)
                         continue
 
+                    # --- unified RX (telemetry + ACKs) ---
+                    try:
+                        ev = self.radio.poll_event()
+                    except Exception:
+                        # poll_event should already mark disconnected
+                        continue
+
+                    if ev is None:
+                        continue
+
+                    # --- ACK event ---
+                    if isinstance(ev, tuple):
+                        cmd, state = ev
+                        self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
+                        print(f"got ack, state: {state}, CMD: {cmd}")
+                        continue
+
+                    # --- telemetry packet ---
+                    packet = ev
                     rx_timestamp = datetime.now().isoformat(timespec="milliseconds")
 
                     # CSV output
@@ -71,25 +106,29 @@ class RadioWorker(QtCore.QThread):
 
         finally:
             try:
-                radio.close()
+                self.radio.close()
             except Exception:
                 pass
             self.status.emit("Radio closed.")
 
+    def send_command(self, command: str, on: bool):
+        self.radio.send_command(command, on)
+
 
 def main():
-    COM_PORT = "DUMMY"
+    COM_PORT = "/dev/tty.usbserial-BG00HPF3"
     CSV_FILENAME = "serial_data.csv"
 
     app = QtWidgets.QApplication(sys.argv)
 
     # Pass send_command if you want buttons enabled:
     # worker/radio wiring would need a thread-safe command path (we can do that next).
-    win = MainWindow(history=2000)
+    worker = RadioWorker(com_port=COM_PORT, csv_filename=CSV_FILENAME)
+
+    win = MainWindow(history=2000, send_command=worker.send_command)
     win.resize(1100, 800)
     win.show()
 
-    worker = RadioWorker(com_port=COM_PORT, csv_filename=CSV_FILENAME)
     worker.sample.connect(win.on_sample)
 
     worker.status.connect(lambda s: win.setWindowTitle(f"Serial Telemetry Viewer — {s}"))

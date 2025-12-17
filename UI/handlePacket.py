@@ -42,8 +42,8 @@ class PacketHandler:
                 )
 
             # Layout (little-endian):
-            # [header:u8][seq:u8][timestamp:u32][ch0:u32][ch1:u32][adc:u16][crc:u16]
-            header, seq, timestamp, ch0, ch1, adc, crc = struct.unpack("<BBIIIHH", data)
+            # [header:u8][seq:u8][timestamp:u32][ch0:float][ch1:float][adc:u16][crc:u16]
+            header, seq, timestamp, ch0, ch1, adc, crc = struct.unpack("<BBIffHH", data)
 
             return DataPacket(
                 header=header,
