@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import random
-import threading
 import time
-from threading import Thread
 from typing import Optional, Tuple, Union
 
 import serial
@@ -67,6 +65,7 @@ class Radio:
           - ACK tuple (cmd_char, state) (0xAB, 4 bytes)
         """
         if self.simulate:
+            time.sleep(0.01)
             return self._read_simulated_packet()
 
         if not self.is_connected():

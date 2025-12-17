@@ -1,3 +1,4 @@
+# gui.py
 from __future__ import annotations
 
 from collections import deque
@@ -7,19 +8,32 @@ import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
 
+IGNITER_PASSWORD = "67"
+
+
 class MainWindow(QtWidgets.QMainWindow):
+    # logging control signals (GUI -> worker)
+    start_saving = QtCore.pyqtSignal(str)     # filename
+    stop_saving = QtCore.pyqtSignal()
+    pause_saving = QtCore.pyqtSignal(bool)    # True=paused, False=running
+    save_last_10s = QtCore.pyqtSignal(str)    # filename
+
     def __init__(
-            self,
-            *,
-            history: int = 5000,  # max samples stored (raw + filtered)
-            initial_window_seconds: float = 10.0,
-            send_command: Optional[Callable[[str, bool], object]] = None,
-            parent=None,
+        self,
+        *,
+        history: int = 5000,  # max samples stored (raw + filtered)
+        initial_window_seconds: float = 10.0,
+        send_command: Optional[Callable[[str, bool], object]] = None,
+        parent=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Serial Telemetry Viewer")
 
-        self._paused = False
+        # UI state
+        self._paused = False                 # display pause
+        self._saving_active = False          # saving on/off
+        self._saving_paused = False          # saving paused/unpaused
+
         self._history = int(history)
         self._window_seconds = float(initial_window_seconds)
         self._send_command = send_command
@@ -70,12 +84,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_iadc_lbl = QtWidgets.QLabel("Cur IADC: —")
 
         for w in (
-                self.max_ch0_lbl,
-                self.max_ch1_lbl,
-                self.max_iadc_lbl,
-                self.cur_ch0_lbl,
-                self.cur_ch1_lbl,
-                self.cur_iadc_lbl,
+            self.max_ch0_lbl,
+            self.max_ch1_lbl,
+            self.max_iadc_lbl,
+            self.cur_ch0_lbl,
+            self.cur_ch1_lbl,
+            self.cur_iadc_lbl,
         ):
             w.setMinimumWidth(260)
             top.addWidget(w)
@@ -166,6 +180,50 @@ class MainWindow(QtWidgets.QMainWindow):
         cmd_row.addWidget(self.cmd_status_lbl)
 
         # -------------------------------------------------
+        # Saving / Logging row
+        # -------------------------------------------------
+        save_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(save_row)
+
+        save_row.addWidget(QtWidgets.QLabel("CSV file:"))
+        self.filename_edit = QtWidgets.QLineEdit()
+        self.filename_edit.setPlaceholderText("serial_data.csv")
+        self.filename_edit.setFixedWidth(320)
+        save_row.addWidget(self.filename_edit)
+
+        # Start saving (visible only when not saving)
+        self.start_save_btn = QtWidgets.QPushButton("Start saving")
+        self.start_save_btn.clicked.connect(self._on_start_saving)
+        save_row.addWidget(self.start_save_btn)
+
+        # Pause saving (replaces start button when saving is active)
+        self.pause_save_btn = QtWidgets.QPushButton("Pause saving")
+        self.pause_save_btn.setCheckable(True)
+        self.pause_save_btn.toggled.connect(self._on_pause_saving_toggled)
+        self.pause_save_btn.setVisible(False)  # only when saving active
+        save_row.addWidget(self.pause_save_btn)
+
+        # Stop saving (visible only when saving active)
+        self.stop_save_btn = QtWidgets.QPushButton("Stop saving")
+        self.stop_save_btn.clicked.connect(self._on_stop_saving)
+        self.stop_save_btn.setVisible(False)  # only when saving active
+        save_row.addWidget(self.stop_save_btn)
+
+        save_row.addSpacing(20)
+
+        # This button will change text depending on paused/running
+        self.save_last10_btn = QtWidgets.QPushButton("Save last 10s")
+        self.save_last10_btn.clicked.connect(self._on_save_last_10s)
+        self.save_last10_btn.setEnabled(False)  # enabled when saving is paused
+        save_row.addWidget(self.save_last10_btn)
+
+        save_row.addStretch(1)
+
+        self.save_status_lbl = QtWidgets.QLabel("Saving: OFF")
+        self.save_status_lbl.setMinimumWidth(260)
+        save_row.addWidget(self.save_status_lbl)
+
+        # -------------------------------------------------
         # Plots
         # -------------------------------------------------
         pg.setConfigOptions(antialias=True)
@@ -189,26 +247,164 @@ class MainWindow(QtWidgets.QMainWindow):
         self._redraw()
 
     # -------------------------------------------------
+    # Public helper (main.py convenience)
+    # -------------------------------------------------
+    def set_filename(self, filename: str) -> None:
+        self.filename_edit.setText(filename)
+
+    def _get_filename(self) -> str:
+        name = self.filename_edit.text().strip()
+        return name if name else "serial_data.csv"
+
+    def _sync_saving_ui(self) -> None:
+        # Start visible only when not saving
+        self.start_save_btn.setVisible(not self._saving_active)
+
+        # Pause/Stop visible only when saving
+        self.pause_save_btn.setVisible(self._saving_active)
+        self.stop_save_btn.setVisible(self._saving_active)
+
+        if not self._saving_active:
+            self.pause_save_btn.setChecked(False)
+            self.pause_save_btn.setText("Pause saving")
+            self._saving_paused = False
+            self.save_last10_btn.setEnabled(False)
+            self.save_last10_btn.setText("Save last 10s")
+            self.save_status_lbl.setText("Saving: OFF")
+        else:
+            fn = self._get_filename()
+            if self._saving_paused:
+                self.save_status_lbl.setText(f"Saving: PAUSED → {fn}")
+                self.save_last10_btn.setEnabled(True)
+                # NEW: button text indicates it resumes saving too
+                self.save_last10_btn.setText("Save + Resume (10s)")
+                self.pause_save_btn.setText("Resume saving")
+            else:
+                self.save_status_lbl.setText(f"Saving: ON → {fn}")
+                self.save_last10_btn.setEnabled(False)
+                self.save_last10_btn.setText("Save last 10s")
+                self.pause_save_btn.setText("Pause saving")
+
+    # -------------------------------------------------
+    # Guards
+    # -------------------------------------------------
+    def _confirm(self, title: str, text: str) -> bool:
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            title,
+            text,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return resp == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _prompt_igniter_password(self) -> bool:
+        pw, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Igniter arming",
+            "Enter igniter password:",
+            QtWidgets.QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            self.cmd_status_lbl.setText("Igniter: cancelled")
+            return False
+        if pw.strip() != IGNITER_PASSWORD:
+            self.cmd_status_lbl.setText("Igniter: wrong password")
+            return False
+        return True
+
+    # -------------------------------------------------
+    # Saving UI callbacks
+    # -------------------------------------------------
+    def _on_start_saving(self) -> None:
+        fn = self._get_filename()
+        self._saving_active = True
+        self._saving_paused = False
+        self.start_saving.emit(fn)
+        self.pause_saving.emit(False)  # ensure running
+        self._sync_saving_ui()
+
+    def _on_stop_saving(self) -> None:
+        if not self._saving_active:
+            return
+
+        if not self._confirm(
+            "Stop saving?",
+            "This will stop writing data to the CSV file.\n\nStop saving now?",
+        ):
+            return
+
+        self._saving_active = False
+        self._saving_paused = False
+        self.stop_saving.emit()
+        self.pause_saving.emit(False)
+        self._sync_saving_ui()
+
+    def _on_pause_saving_toggled(self, checked: bool) -> None:
+        if not self._saving_active:
+            self.pause_save_btn.setChecked(False)
+            return
+        self._saving_paused = bool(checked)
+        self.pause_saving.emit(self._saving_paused)
+        self._sync_saving_ui()
+
+    def _on_save_last_10s(self) -> None:
+        """
+        NEW behavior:
+        - When saving is paused, this does:
+            1) save last 10s
+            2) resume saving immediately
+        - UI updates accordingly (button text + pause toggle)
+        """
+        if not self._saving_active or not self._saving_paused:
+            return
+
+        fn = self._get_filename()
+
+        # 1) Save last 10 seconds
+        self.save_last_10s.emit(fn)
+
+        # 2) Resume saving immediately
+        self._saving_paused = False
+        # blockSignals avoids recursion via toggled signal
+        self.pause_save_btn.blockSignals(True)
+        self.pause_save_btn.setChecked(False)
+        self.pause_save_btn.blockSignals(False)
+
+        self.pause_saving.emit(False)
+
+        # 3) Update UI
+        self.save_status_lbl.setText(f"Saved 10s, resumed → {fn}")
+        self._sync_saving_ui()
+
+    # -------------------------------------------------
     # Command handling
     # -------------------------------------------------
     def _do_send_command(self, cmd: str, on: bool) -> None:
         if self._send_command is None:
             self.cmd_status_lbl.setText("ACK: no radio hooked up")
             return
+
+        # Guard igniter
+        if cmd.upper() == "I" and on:
+            if not self._prompt_igniter_password():
+                return
+
+            if not self._confirm(
+                "IGNITER ON",
+                "You are about to turn the IGNITER ON.\n\nAre you absolutely sure?",
+            ):
+                self.cmd_status_lbl.setText("Igniter: aborted")
+                return
+
         self._send_command(cmd, on)
         self.cmd_status_lbl.setText(f"Sent: {cmd} {'ON' if on else 'OFF'} (waiting...)")
-
-    @QtCore.pyqtSlot(str)
-    def on_status(self, msg: str) -> None:
-        if msg.startswith("ACK:"):
-            self.cmd_status_lbl.setText(msg)
-        else:
-            self.setWindowTitle(f"Serial Telemetry Viewer — {msg}")
 
     # -------------------------------------------------
     # UI callbacks
     # -------------------------------------------------
     def _on_pause_toggled(self, checked: bool) -> None:
+        # display pause only (does NOT affect saving)
         self._paused = checked
         self.pause_btn.setText("Resume" if checked else "Pause")
 
@@ -228,7 +424,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_filter_changed(self, value: int) -> None:
         self._ema_alpha = float(value) / 100.0
         self.filter_value_lbl.setText(f"{self._ema_alpha:.2f}")
-        # (optional) reset EMA so new alpha doesn't “inherit” old smoothing
         self._reset_filter_state()
 
     def _reset_filter_state(self) -> None:
@@ -264,12 +459,10 @@ class MainWindow(QtWidgets.QMainWindow):
             y1 = list(self._raw_ch1)
             y2 = list(self._raw_iadc)
 
-        # Slice to last window_seconds (but keep full buffers intact)
         if not xs:
             return [], [], [], []
 
         cutoff = xs[-1] - self._window_seconds
-        # find first index >= cutoff
         i0 = 0
         for i, x in enumerate(xs):
             if x >= cutoff:
@@ -295,13 +488,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return "—" if v is None else f"{int(v)}"
 
         ws = int(self._window_seconds)
-        mode = "F" if self._filter_enabled else "R"  # filtered / raw
+        mode = "F" if self._filter_enabled else "R"
 
         self.max_ch0_lbl.setText(f"Max Ch0 ({ws}s) [{mode}]: {ff(self._max_ch0)}")
         self.max_ch1_lbl.setText(f"Max Ch1 ({ws}s) [{mode}]: {ff(self._max_ch1)}")
         self.max_iadc_lbl.setText(f"Max IADC ({ws}s) [{mode}]: {fi(self._max_iadc)}")
 
-        # current (last sample) in active mode
         if not self._xs:
             self.cur_ch0_lbl.setText("Cur Ch0: —")
             self.cur_ch1_lbl.setText("Cur Ch1: —")
@@ -342,13 +534,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._paused:
             return
 
-        # Always store raw
         self._xs.append(float(t_seconds))
         self._raw_ch0.append(float(ch0))
         self._raw_ch1.append(float(ch1))
         self._raw_iadc.append(int(internal_adc))
 
-        # Always compute & store filtered (so toggling shows history too)
         a = self._ema_alpha
         if self._ema_ch0 is None:
             self._ema_ch0 = float(ch0)
