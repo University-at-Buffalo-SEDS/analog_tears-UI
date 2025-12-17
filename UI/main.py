@@ -252,13 +252,14 @@ class RadioWorker(QtCore.QThread):
                 # GUI update
                 try:
                     t = time.monotonic() - t0
-                    ch0_kg = (packet.channel0 / 5.831609e-05) - (-21.2)
-                    ch1_kg = (packet.channel1 / 2.929497e-06) - (10 - 7.2)
+                    ch0_kg = (packet.channel0 / 5.831609e-05) - (-21.2) - 41.3
+                    ch1_kg = (packet.channel1 / 2.929497e-06) - (10 - 1.8)
+                    iadc = (packet.internal_adc / 1.78)
                     self.sample.emit(
                         float(t),
                         float(ch0_kg),
                         float(ch1_kg),
-                        int(packet.internal_adc),
+                        int(iadc),
                     )
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
@@ -273,7 +274,7 @@ class RadioWorker(QtCore.QThread):
 
 
 def main():
-    COM_PORT = "DUMMY"  # "/dev/tty.usbserial-BG00HPF3"
+    COM_PORT = "/dev/tty.usbserial-BG00HPF3"
     DEFAULT_CSV_FILENAME = "serial_data.csv"
 
     app = QtWidgets.QApplication(sys.argv)
