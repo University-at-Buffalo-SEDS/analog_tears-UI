@@ -79,7 +79,6 @@ class RadioWorker(QtCore.QThread):
                     if isinstance(ev, tuple):
                         cmd, state = ev
                         self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
-                        print(f"got ack, state: {state}, CMD: {cmd}")
                         continue
 
                     # --- telemetry packet ---
@@ -131,8 +130,13 @@ def main():
 
     worker.sample.connect(win.on_sample)
 
-    worker.status.connect(lambda s: win.setWindowTitle(f"Serial Telemetry Viewer — {s}"))
+    def handle_status(s: str) -> None:
+        if s.startswith("ACK:"):
+            win.cmd_status_lbl.setText(s)  # <-- update the ACK label
+        else:
+            win.setWindowTitle(f"Serial Telemetry Viewer — {s}")
 
+    worker.status.connect(handle_status)
     app.aboutToQuit.connect(lambda: (worker.stop(), worker.wait(2000)))
 
     worker.start()

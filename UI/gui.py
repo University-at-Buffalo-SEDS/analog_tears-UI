@@ -154,15 +154,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            ack = self._send_command(cmd, on)
-            if ack is None:
-                self.cmd_status_lbl.setText(f"ACK: {cmd} {'ON' if on else 'OFF'} (no ack)")
-            else:
-                a_cmd, a_state = ack
-                self.cmd_status_lbl.setText(f"ACK: {a_cmd} {'ON' if a_state else 'OFF'}")
+            # fire-and-forget; ACK will arrive later via on_status()
+            self._send_command(cmd, on)
+            self.cmd_status_lbl.setText(f"Sent: {cmd} {'ON' if on else 'OFF'} (waiting...)")
         except Exception as e:
             self.cmd_status_lbl.setText(f"ACK: error ({e})")
-
+    @QtCore.pyqtSlot(str)
+    def on_status(self, msg: str) -> None:
+        # Route ACK messages to the ACK label, everything else to window status/title
+        if msg.startswith("ACK:"):
+            self.cmd_status_lbl.setText(msg)
+        else:
+            self.setWindowTitle(f"Serial Telemetry Viewer — {msg}")
     # --------------------
     # UI callbacks
     # --------------------
