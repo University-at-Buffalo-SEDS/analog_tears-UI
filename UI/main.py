@@ -15,6 +15,8 @@ from PyQt6 import QtCore, QtWidgets
 from gui import MainWindow
 from radio import Radio
 
+frontend_disable_pilot = False
+
 
 @dataclass(frozen=True)
 class CsvKey:
@@ -219,18 +221,19 @@ class RadioWorker(QtCore.QThread):
                 if isinstance(ev, tuple):
                     cmd, state = ev
                     self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
-                    if cmd == "I":
-                        seen_igniter_command = True
+                    if frontend_disable_pilot:
+                        if cmd == "I":
+                            seen_igniter_command = True
 
-                    if seen_igniter_command and cmd == "P" and state == True:
-                        turn_p_off = True
-                        p_start = time.monotonic()
+                        if seen_igniter_command and cmd == "P" and state == True:
+                            turn_p_off = True
+                            p_start = time.monotonic()
                     continue
-
-                if turn_p_off and time.monotonic() - p_start > 1.5:
-                    self.send_command("P", False)
-                    seen_igniter_command = False
-                    turn_p_off = False
+                if frontend_disable_pilot:
+                    if turn_p_off and time.monotonic() - p_start > 1.5:
+                        self.send_command("P", False)
+                        seen_igniter_command = False
+                        turn_p_off = False
 
                 # --- telemetry packet ---
                 packet = ev
@@ -266,7 +269,7 @@ class RadioWorker(QtCore.QThread):
                 # GUI update
                 try:
                     t = time.monotonic() - t0
-                    ch0_kg = (packet.channel0 / 5.831609e-05) - (-21.2) - 41.3
+                    ch0_kg = (packet.channel0 / 5.831609e-05) - (-21.2) - 54.3
                     ch1_kg = (packet.channel1 / 2.929497e-06) - (10 - 1.8)
                     iadc = (packet.internal_adc / 1.78)
                     self.sample.emit(
