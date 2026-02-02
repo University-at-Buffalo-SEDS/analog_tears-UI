@@ -1,0 +1,9 @@
+.idea/
+__pycache__/
+*.pyc
+env/
+.venv/
+
+UI/serial_data.csv
+
+.DS_Store
