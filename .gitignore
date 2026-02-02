@@ -5,3 +5,5 @@ env/
 .venv/
 
 UI/serial_data.csv
+
+.DS_Store
