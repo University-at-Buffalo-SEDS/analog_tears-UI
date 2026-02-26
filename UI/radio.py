@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+import struct
 import time
 from typing import Optional, Tuple, Union
 
@@ -61,7 +62,7 @@ class Radio:
     def poll_event(self) -> Optional[RadioEvent]:
         """
         Pull bytes once, then return the next parsed thing:
-          - DataPacket (0xAC, 18 bytes)
+          - DataPacket (0xAC, 22 bytes)
           - ACK tuple (cmd_char, state) (0xAB, 4 bytes)
         """
         if self.simulate:
@@ -182,8 +183,10 @@ class Radio:
         ch0 = self._rng.uniform(0.0, 1000.0)
         ch1 = self._rng.uniform(0.0, 1000.0)
         iadc = self._rng.randint(0, 1023)
+        batt = self._rng.uniform(11.0, 16.8)
 
-        crc = (int(ch0 * 1000) ^ int(ch1 * 1000) ^ iadc ^ self._sim_seq) & 0xFFFF
+        body = struct.pack("<BBIffHf", 0xAC, self._sim_seq, int(now * 1000), ch0, ch1, iadc, batt)
+        crc = PacketHandler.crc16(body)
 
         return DataPacket(
             header=0xAC,
@@ -192,6 +195,7 @@ class Radio:
             channel0=float(ch0),
             channel1=float(ch1),
             internal_adc=iadc,
+            battery_voltage=batt,
             crc=crc,
         )
 

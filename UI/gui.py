@@ -46,6 +46,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ema_ch0: Optional[float] = None
         self._ema_ch1: Optional[float] = None
         self._ema_iadc: Optional[float] = None
+        self._ema_batt: Optional[float] = None
 
         # Full history buffers (DO NOT time-trim; only capped by history samples)
         self._xs = deque(maxlen=self._history)
@@ -54,16 +55,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_ch0 = deque(maxlen=self._history)
         self._raw_ch1 = deque(maxlen=self._history)
         self._raw_iadc = deque(maxlen=self._history)
+        self._raw_batt = deque(maxlen=self._history)
 
         # Filtered series (EMA)
         self._flt_ch0 = deque(maxlen=self._history)
         self._flt_ch1 = deque(maxlen=self._history)
         self._flt_iadc = deque(maxlen=self._history)
+        self._flt_batt = deque(maxlen=self._history)
 
         # Cached window maxes (computed over currently displayed series)
         self._max_ch0: Optional[float] = None
         self._max_ch1: Optional[float] = None
         self._max_iadc: Optional[float] = None
+        self._max_batt: Optional[float] = None
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -78,18 +82,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_ch0_lbl = QtWidgets.QLabel()
         self.max_ch1_lbl = QtWidgets.QLabel()
         self.max_iadc_lbl = QtWidgets.QLabel()
+        self.max_batt_lbl = QtWidgets.QLabel()
 
         self.cur_ch0_lbl = QtWidgets.QLabel("Cur Ch0: —")
         self.cur_ch1_lbl = QtWidgets.QLabel("Cur Ch1: —")
         self.cur_iadc_lbl = QtWidgets.QLabel("Cur IADC: —")
+        self.cur_batt_lbl = QtWidgets.QLabel("Cur BattV: —")
 
         for w in (
             self.max_ch0_lbl,
             self.max_ch1_lbl,
             self.max_iadc_lbl,
+            self.max_batt_lbl,
             self.cur_ch0_lbl,
             self.cur_ch1_lbl,
             self.cur_iadc_lbl,
+            self.cur_batt_lbl,
         ):
             w.setMinimumWidth(260)
             top.addWidget(w)
@@ -233,14 +241,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p0 = self.plot_widget.addPlot(row=0, col=0, title="Channel 0")
         self.p1 = self.plot_widget.addPlot(row=1, col=0, title="Channel 1")
         self.p2 = self.plot_widget.addPlot(row=2, col=0, title="Internal ADC")
+        self.p3 = self.plot_widget.addPlot(row=3, col=0, title="Battery Voltage")
 
-        for p in (self.p0, self.p1, self.p2):
+        for p in (self.p0, self.p1, self.p2, self.p3):
             p.showGrid(x=True, y=True)
             p.setLabel("bottom", "Time (s)")
 
         self.c0 = self.p0.plot([], [])
         self.c1 = self.p1.plot([], [])
         self.c2 = self.p2.plot([], [])
+        self.c3 = self.p3.plot([], [])
 
         self._recompute_window_maxes()
         self._update_labels()
@@ -430,17 +440,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ema_ch0 = None
         self._ema_ch1 = None
         self._ema_iadc = None
+        self._ema_batt = None
 
     def _clear(self) -> None:
         self._xs.clear()
         self._raw_ch0.clear()
         self._raw_ch1.clear()
         self._raw_iadc.clear()
+        self._raw_batt.clear()
         self._flt_ch0.clear()
         self._flt_ch1.clear()
         self._flt_iadc.clear()
+        self._flt_batt.clear()
 
-        self._max_ch0 = self._max_ch1 = self._max_iadc = None
+        self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
         self._reset_filter_state()
         self._update_labels()
         self._redraw()
@@ -448,19 +461,21 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------
     # Window view helpers (slice only; do NOT delete history)
     # -------------------------------------------------
-    def _get_active_series(self) -> Tuple[list, list, list, list]:
+    def _get_active_series(self) -> Tuple[list, list, list, list, list]:
         xs = list(self._xs)
         if self._filter_enabled:
             y0 = list(self._flt_ch0)
             y1 = list(self._flt_ch1)
             y2 = list(self._flt_iadc)
+            y3 = list(self._flt_batt)
         else:
             y0 = list(self._raw_ch0)
             y1 = list(self._raw_ch1)
             y2 = list(self._raw_iadc)
+            y3 = list(self._raw_batt)
 
         if not xs:
-            return [], [], [], []
+            return [], [], [], [], []
 
         cutoff = xs[-1] - self._window_seconds
         i0 = 0
@@ -469,16 +484,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 i0 = i
                 break
 
-        return xs[i0:], y0[i0:], y1[i0:], y2[i0:]
+        return xs[i0:], y0[i0:], y1[i0:], y2[i0:], y3[i0:]
 
     def _recompute_window_maxes(self) -> None:
-        xs, y0, y1, y2 = self._get_active_series()
+        xs, y0, y1, y2, y3 = self._get_active_series()
         if not xs:
-            self._max_ch0 = self._max_ch1 = self._max_iadc = None
+            self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
             return
         self._max_ch0 = max(y0) if y0 else None
         self._max_ch1 = max(y1) if y1 else None
         self._max_iadc = max(y2) if y2 else None
+        self._max_batt = max(y3) if y3 else None
 
     def _update_labels(self) -> None:
         def ff(v):
@@ -493,44 +509,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_ch0_lbl.setText(f"Max Ch0 ({ws}s) [{mode}]: {ff(self._max_ch0)}")
         self.max_ch1_lbl.setText(f"Max Ch1 ({ws}s) [{mode}]: {ff(self._max_ch1)}")
         self.max_iadc_lbl.setText(f"Max IADC ({ws}s) [{mode}]: {fi(self._max_iadc)}")
+        self.max_batt_lbl.setText(f"Max BattV ({ws}s) [{mode}]: {ff(self._max_batt)}")
 
         if not self._xs:
             self.cur_ch0_lbl.setText("Cur Ch0: —")
             self.cur_ch1_lbl.setText("Cur Ch1: —")
             self.cur_iadc_lbl.setText("Cur IADC: —")
+            self.cur_batt_lbl.setText("Cur BattV: —")
             return
 
         if self._filter_enabled:
             c0 = self._flt_ch0[-1] if self._flt_ch0 else None
             c1 = self._flt_ch1[-1] if self._flt_ch1 else None
             ci = self._flt_iadc[-1] if self._flt_iadc else None
+            cb = self._flt_batt[-1] if self._flt_batt else None
         else:
             c0 = self._raw_ch0[-1] if self._raw_ch0 else None
             c1 = self._raw_ch1[-1] if self._raw_ch1 else None
             ci = self._raw_iadc[-1] if self._raw_iadc else None
+            cb = self._raw_batt[-1] if self._raw_batt else None
 
         self.cur_ch0_lbl.setText(f"Cur Ch0 [{mode}]: {ff(c0)}")
         self.cur_ch1_lbl.setText(f"Cur Ch1 [{mode}]: {ff(c1)}")
         self.cur_iadc_lbl.setText(f"Cur IADC [{mode}]: {fi(ci)}")
+        self.cur_batt_lbl.setText(f"Cur BattV [{mode}]: {ff(cb)}")
 
     def _redraw(self) -> None:
-        xs, y0, y1, y2 = self._get_active_series()
+        xs, y0, y1, y2, y3 = self._get_active_series()
 
         self.c0.setData(xs, y0)
         self.c1.setData(xs, y1)
         self.c2.setData(xs, y2)
+        self.c3.setData(xs, y3)
 
         if xs:
             xmin = xs[-1] - self._window_seconds
             xmax = xs[-1]
-            for p in (self.p0, self.p1, self.p2):
+            for p in (self.p0, self.p1, self.p2, self.p3):
                 p.setXRange(xmin, xmax, padding=0)
 
     # -------------------------------------------------
     # Data entry
     # -------------------------------------------------
-    @QtCore.pyqtSlot(float, float, float, int)
-    def on_sample(self, t_seconds: float, ch0: float, ch1: float, internal_adc: int) -> None:
+    @QtCore.pyqtSlot(float, float, float, int, float)
+    def on_sample(
+        self,
+        t_seconds: float,
+        ch0: float,
+        ch1: float,
+        internal_adc: int,
+        battery_voltage: float,
+    ) -> None:
         if self._paused:
             return
 
@@ -538,20 +567,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_ch0.append(float(ch0))
         self._raw_ch1.append(float(ch1))
         self._raw_iadc.append(int(internal_adc))
+        self._raw_batt.append(float(battery_voltage))
 
         a = self._ema_alpha
         if self._ema_ch0 is None:
             self._ema_ch0 = float(ch0)
             self._ema_ch1 = float(ch1)
             self._ema_iadc = float(internal_adc)
+            self._ema_batt = float(battery_voltage)
         else:
             self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * float(ch0)
             self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * float(ch1)
             self._ema_iadc = (1.0 - a) * self._ema_iadc + a * float(internal_adc)
+            self._ema_batt = (1.0 - a) * self._ema_batt + a * float(battery_voltage)
 
         self._flt_ch0.append(float(self._ema_ch0))
         self._flt_ch1.append(float(self._ema_ch1))
         self._flt_iadc.append(int(round(self._ema_iadc)))
+        self._flt_batt.append(float(self._ema_batt))
 
         self._recompute_window_maxes()
         self._update_labels()

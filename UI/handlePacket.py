@@ -7,7 +7,7 @@ from packet import DataPacket
 
 
 class PacketHandler:
-    PACKET_SIZE = 18
+    PACKET_SIZE = 22
     EXPECTED_HEADER = 0xAC
 
     CMD_HEADER = 0xAA
@@ -21,12 +21,53 @@ class PacketHandler:
     CMD_ON = 0x01
     CMD_OFF = 0x02
 
+    # CRC-16 parameters (adjust to match firmware)
+    CRC16_POLY = 0x1021
+    CRC16_INIT = 0xFFFF
+    CRC16_XOROUT = 0x0000
+    CRC16_REFLECT = False
+
     @staticmethod
     def crc8_xor(data: bytes) -> int:
         c = 0
         for b in data:
             c ^= b
         return c & 0xFF
+
+    @staticmethod
+    def _crc16_reflect8(x: int) -> int:
+        x &= 0xFF
+        r = 0
+        for _ in range(8):
+            r = (r << 1) | (x & 1)
+            x >>= 1
+        return r & 0xFF
+
+    @staticmethod
+    def crc16(data: bytes) -> int:
+        crc = PacketHandler.CRC16_INIT & 0xFFFF
+        poly = PacketHandler.CRC16_POLY & 0xFFFF
+
+        for b in data:
+            if PacketHandler.CRC16_REFLECT:
+                b = PacketHandler._crc16_reflect8(b)
+            crc ^= (b << 8) & 0xFFFF
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = ((crc << 1) ^ poly) & 0xFFFF
+                else:
+                    crc = (crc << 1) & 0xFFFF
+
+        if PacketHandler.CRC16_REFLECT:
+            # reflect output if using reflected mode
+            out = 0
+            x = crc & 0xFFFF
+            for _ in range(16):
+                out = (out << 1) | (x & 1)
+                x >>= 1
+            crc = out & 0xFFFF
+
+        return (crc ^ PacketHandler.CRC16_XOROUT) & 0xFFFF
 
     @staticmethod
     def decode_packet(data: bytes) -> DataPacket | None:
@@ -42,8 +83,16 @@ class PacketHandler:
                 )
 
             # Layout (little-endian):
-            # [header:u8][seq:u8][timestamp:u32][ch0:float][ch1:float][adc:u16][crc:u16]
-            header, seq, timestamp, ch0, ch1, adc, crc = struct.unpack("<BBIffHH", data)
+            # [header:u8][seq:u8][timestamp:u32][ch0:float][ch1:float]
+            # [adc:u16][battery_voltage:float][crc:u16]
+            header, seq, timestamp, ch0, ch1, adc, battery_voltage, crc = struct.unpack(
+                "<BBIffHfH",
+                data,
+            )
+
+            calc_crc = PacketHandler.crc16(data[:-2])
+            if (crc & 0xFFFF) != calc_crc:
+                raise ValueError(f"CRC mismatch: got 0x{crc:04X}, expected 0x{calc_crc:04X}")
 
             return DataPacket(
                 header=header,
@@ -52,6 +101,7 @@ class PacketHandler:
                 channel0=ch0,
                 channel1=ch1,
                 internal_adc=adc,
+                battery_voltage=battery_voltage,
                 crc=crc,
             )
         except Exception as e:

@@ -1,3 +1,4 @@
+#! /usr/bin/env python3
 # main.py
 from __future__ import annotations
 
@@ -38,8 +39,8 @@ class RadioWorker(QtCore.QThread):
     Background serial read loop.
     Emits values to GUI and (optionally) logs to CSV.
     """
-    # t_seconds, ch0(float), ch1(float), internal_adc(int)
-    sample = QtCore.pyqtSignal(float, float, float, int)
+    # t_seconds, ch0(float), ch1(float), internal_adc(int), battery_voltage(float)
+    sample = QtCore.pyqtSignal(float, float, float, int, float)
     status = QtCore.pyqtSignal(str)
 
     def __init__(self, *, com_port: str, parent=None):
@@ -136,6 +137,7 @@ class RadioWorker(QtCore.QThread):
                 "Ch0",
                 "Ch1",
                 "Internal ADC",
+                "Battery Voltage",
                 "CRC",
             ])
             self._csv_file.flush()
@@ -243,13 +245,13 @@ class RadioWorker(QtCore.QThread):
                 # Build CSV row + dedupe key
                 try:
                     # expects packet.to_csv_row(rx_timestamp) returns:
-                    # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, crc]
+                    # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, battery_voltage, crc]
                     row = packet.to_csv_row(rx_timestamp)
                     key = CsvKey(
                         header=int(row[1]),
                         seq=int(row[2]),
                         timestamp=int(row[3]),
-                        crc=int(row[7]),
+                        crc=int(row[8]),
                     )
                 except Exception as e:
                     self.status.emit(f"Packet->CSV error: {e}")
@@ -272,11 +274,13 @@ class RadioWorker(QtCore.QThread):
                     ch0_kg = (packet.channel0 / 5.831609e-05) - (-21.2) - 54.3
                     ch1_kg = (packet.channel1 / 2.929497e-06) - (10 - 1.8)
                     iadc = (packet.internal_adc / 1.78)
+                    batt_v = float(packet.battery_voltage)
                     self.sample.emit(
                         float(t),
                         float(ch0_kg),
                         float(ch1_kg),
                         int(iadc),
+                        batt_v,
                     )
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
