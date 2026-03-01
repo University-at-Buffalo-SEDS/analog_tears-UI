@@ -1,14 +1,157 @@
 # gui.py
 from __future__ import annotations
 
+import json
+import hashlib
+import hmac
 from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Callable, Tuple
 
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
 
-IGNITER_PASSWORD = "67"
+IGNITER_AUTH_FILE = Path(__file__).with_name("igniter_auth.json")
+
+
+@dataclass(frozen=True)
+class _CalPoint:
+    weight: float
+    ch0_raw: float
+    ch1_raw: float
+
+
+class _CalibrationDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        *,
+        channel: int,
+        samples_per_point: int,
+        start_capture,
+        existing_points: list[_CalPoint],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"Calibrate Ch{channel}")
+        self.setModal(True)
+        self.resize(420, 320)
+
+        self._channel = channel
+        self._samples_per_point = samples_per_point
+        self._start_capture = start_capture
+        self._points: list[_CalPoint] = list(existing_points)
+        self._capturing = False
+        self._current_weight: Optional[float] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.info_lbl = QtWidgets.QLabel(
+            "Step 1 sets the 0 kg point. After that you can enter any whole kg value."
+        )
+        layout.addWidget(self.info_lbl)
+
+        self.list = QtWidgets.QListWidget()
+        layout.addWidget(self.list, stretch=1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(btn_row)
+
+        self.next_btn = QtWidgets.QPushButton("Capture next point")
+        self.next_btn.clicked.connect(self._on_next)
+        btn_row.addWidget(self.next_btn)
+
+        self.finish_btn = QtWidgets.QPushButton("Finish")
+        self.finish_btn.setEnabled(len(self._points) >= 3)
+        self.finish_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.finish_btn)
+
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+
+        self.status_lbl = QtWidgets.QLabel("Status: —")
+        layout.addWidget(self.status_lbl)
+
+        self._refresh_list()
+
+    def points(self) -> list[_CalPoint]:
+        return list(self._points)
+
+    def _refresh_list(self) -> None:
+        self.list.clear()
+        if not self._points:
+            self.list.addItem("(no points yet)")
+            return
+        for p in self._points:
+            raw = p.ch0_raw if self._channel == 0 else p.ch1_raw
+            self.list.addItem(f"{p.weight:g} kg → raw {raw:.6g}")
+
+    def _on_next(self) -> None:
+        if self._capturing:
+            return
+
+        if not self._points:
+            weight = 0.0
+        else:
+            w, ok = QtWidgets.QInputDialog.getInt(
+                self,
+                "Next calibration point",
+                "Enter next weight (whole kg):",
+                value=int(self._points[-1].weight),
+                min=0,
+                max=10000,
+                step=1,
+            )
+            if not ok:
+                self.status_lbl.setText("Status: canceled")
+                return
+            weight = float(w)
+
+        prompt = (
+            f"Place {weight:g} kg on Ch{self._channel}.\n\n"
+            f"Keep the load steady, then click OK to capture {self._samples_per_point} samples."
+        )
+        ok = QtWidgets.QMessageBox.question(
+            self,
+            f"Calibrate Ch{self._channel}",
+            prompt,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if ok != QtWidgets.QMessageBox.StandardButton.Yes:
+            self.status_lbl.setText("Status: canceled")
+            return
+
+        self._capturing = True
+        self._current_weight = weight
+        self.next_btn.setEnabled(False)
+        self.finish_btn.setEnabled(False)
+        self.status_lbl.setText(
+            f"Status: capturing {self._samples_per_point} samples at {weight:g} kg..."
+        )
+
+        def on_done(avg_raw: float) -> None:
+            if self._channel == 0:
+                self._points.append(_CalPoint(weight=weight, ch0_raw=avg_raw, ch1_raw=0.0))
+            else:
+                self._points.append(_CalPoint(weight=weight, ch0_raw=0.0, ch1_raw=avg_raw))
+
+            self._capturing = False
+            self._current_weight = None
+            self.next_btn.setEnabled(True)
+            self.finish_btn.setEnabled(len(self._points) >= 3)
+            self.status_lbl.setText(f"Status: captured {weight:g} kg (avg raw={avg_raw:.6g})")
+            self._refresh_list()
+
+        def on_progress(count: int, total: int) -> None:
+            if self._capturing and self._current_weight is not None:
+                self.status_lbl.setText(
+                    f"Status: capturing {count}/{total} samples at {self._current_weight:g} kg..."
+                )
+
+        self._start_capture(self._channel, on_done, on_progress)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -17,6 +160,7 @@ class MainWindow(QtWidgets.QMainWindow):
     stop_saving = QtCore.pyqtSignal()
     pause_saving = QtCore.pyqtSignal(bool)    # True=paused, False=running
     save_last_10s = QtCore.pyqtSignal(str)    # filename
+    calibration_saved = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -68,6 +212,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._max_ch1: Optional[float] = None
         self._max_iadc: Optional[float] = None
         self._max_batt: Optional[float] = None
+
+        # Calibration state
+        self._calib_points_ch0: list[_CalPoint] = []
+        self._calib_points_ch1: list[_CalPoint] = []
+        self._calib_samples_per_point = 50
+        self._calib_pending_channel: Optional[int] = None
+        self._calib_pending_samples: list[float] = []
+        self._calib_pending_callback = None
+        self._calib_pending_progress_cb = None
+        self._raw_ch0_recent = deque(maxlen=40)
+        self._raw_ch1_recent = deque(maxlen=40)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -195,7 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         save_row.addWidget(QtWidgets.QLabel("CSV file:"))
         self.filename_edit = QtWidgets.QLineEdit()
-        self.filename_edit.setPlaceholderText("serial_data.csv")
+        self.filename_edit.setPlaceholderText("Data/HTF_Data.csv")
         self.filename_edit.setFixedWidth(320)
         save_row.addWidget(self.filename_edit)
 
@@ -232,6 +387,41 @@ class MainWindow(QtWidgets.QMainWindow):
         save_row.addWidget(self.save_status_lbl)
 
         # -------------------------------------------------
+        # Calibration row
+        # -------------------------------------------------
+        calib_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(calib_row)
+
+        calib_row.addWidget(QtWidgets.QLabel("Calibration:"))
+
+        self.calib_filename_edit = QtWidgets.QLineEdit()
+        self.calib_filename_edit.setFixedWidth(320)
+        self.calib_filename_edit.setPlaceholderText("loadcell_calibration.json")
+        calib_row.addWidget(self.calib_filename_edit)
+
+        self.calib_ch0_btn = QtWidgets.QPushButton("Calibrate Ch0…")
+        self.calib_ch0_btn.clicked.connect(lambda: self._open_calibration_dialog(0))
+        calib_row.addWidget(self.calib_ch0_btn)
+
+        self.calib_ch1_btn = QtWidgets.QPushButton("Calibrate Ch1…")
+        self.calib_ch1_btn.clicked.connect(lambda: self._open_calibration_dialog(1))
+        calib_row.addWidget(self.calib_ch1_btn)
+
+        self.calib_save_btn = QtWidgets.QPushButton("Save calibration")
+        self.calib_save_btn.clicked.connect(self._save_calibration)
+        calib_row.addWidget(self.calib_save_btn)
+
+        self.calib_reset_btn = QtWidgets.QPushButton("Reset points")
+        self.calib_reset_btn.clicked.connect(self._reset_calibration_points)
+        calib_row.addWidget(self.calib_reset_btn)
+
+        calib_row.addStretch(1)
+
+        self.calib_status_lbl = QtWidgets.QLabel("Calib: —")
+        self.calib_status_lbl.setMinimumWidth(260)
+        calib_row.addWidget(self.calib_status_lbl)
+
+        # -------------------------------------------------
         # Plots
         # -------------------------------------------------
         pg.setConfigOptions(antialias=True)
@@ -262,9 +452,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_filename(self, filename: str) -> None:
         self.filename_edit.setText(filename)
 
+    def set_calibration_filename(self, filename: str) -> None:
+        self.calib_filename_edit.setText(filename)
+
     def _get_filename(self) -> str:
         name = self.filename_edit.text().strip()
-        return name if name else "serial_data.csv"
+        return name if name else "Data/HTF_Data.csv"
+
+    def _get_calibration_filename(self) -> str:
+        name = self.calib_filename_edit.text().strip()
+        return name if name else "loadcell_calibration.json"
 
     def _sync_saving_ui(self) -> None:
         # Start visible only when not saving
@@ -318,7 +515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok:
             self.cmd_status_lbl.setText("Igniter: cancelled")
             return False
-        if pw.strip() != IGNITER_PASSWORD:
+        if not self._verify_igniter_password(pw.strip()):
             self.cmd_status_lbl.setText("Igniter: wrong password")
             return False
         return True
@@ -458,6 +655,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_labels()
         self._redraw()
 
+    def _reset_calibration_points(self) -> None:
+        self._calib_points_ch0.clear()
+        self._calib_points_ch1.clear()
+        self._calib_pending_channel = None
+        self._calib_pending_samples.clear()
+        self.calib_status_lbl.setText("Calib: reset")
+
     # -------------------------------------------------
     # Window view helpers (slice only; do NOT delete history)
     # -------------------------------------------------
@@ -589,3 +793,159 @@ class MainWindow(QtWidgets.QMainWindow):
         self._recompute_window_maxes()
         self._update_labels()
         self._redraw()
+
+    @QtCore.pyqtSlot(float, float)
+    def on_raw_sample(self, ch0_raw: float, ch1_raw: float) -> None:
+        self._raw_ch0_recent.append(float(ch0_raw))
+        self._raw_ch1_recent.append(float(ch1_raw))
+
+        # Calibration capture (averaging)
+        if self._calib_pending_channel is None:
+            return
+
+        if self._calib_pending_channel == 0:
+            self._calib_pending_samples.append(float(ch0_raw))
+        else:
+            self._calib_pending_samples.append(float(ch1_raw))
+
+        if self._calib_pending_progress_cb is not None:
+            self._calib_pending_progress_cb(
+                len(self._calib_pending_samples), self._calib_samples_per_point
+            )
+
+        if len(self._calib_pending_samples) >= self._calib_samples_per_point:
+            channel = self._calib_pending_channel
+            avg = sum(self._calib_pending_samples) / len(self._calib_pending_samples)
+
+            cb = self._calib_pending_callback
+            pcb = self._calib_pending_progress_cb
+            self._calib_pending_channel = None
+            self._calib_pending_samples.clear()
+            self._calib_pending_callback = None
+            self._calib_pending_progress_cb = None
+            if cb is not None:
+                cb(avg)
+            if pcb is not None:
+                pcb(self._calib_samples_per_point, self._calib_samples_per_point)
+
+    # -------------------------------------------------
+    # Calibration helpers
+    # -------------------------------------------------
+    def _open_calibration_dialog(self, channel: int) -> None:
+        points = self._calib_points_ch0 if channel == 0 else self._calib_points_ch1
+
+        def start_capture(ch: int, done_cb, progress_cb) -> None:
+            if self._calib_pending_channel is not None:
+                self.calib_status_lbl.setText("Calib: capture in progress, please wait")
+                return
+            if len(self._raw_ch0_recent) < 5 or len(self._raw_ch1_recent) < 5:
+                self.calib_status_lbl.setText("Calib: not enough samples yet")
+                return
+            self._calib_pending_channel = ch
+            self._calib_pending_samples.clear()
+            self._calib_pending_callback = done_cb
+            self._calib_pending_progress_cb = progress_cb
+
+        dlg = _CalibrationDialog(
+            channel=channel,
+            samples_per_point=self._calib_samples_per_point,
+            start_capture=start_capture,
+            existing_points=points,
+            parent=self,
+        )
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            new_points = dlg.points()
+            if channel == 0:
+                self._calib_points_ch0 = new_points
+            else:
+                self._calib_points_ch1 = new_points
+            self.calib_status_lbl.setText(
+                f"Calib: Ch{channel} points set ({len(new_points)} point(s))"
+            )
+
+    def _verify_igniter_password(self, password: str) -> bool:
+        if not IGNITER_AUTH_FILE.exists():
+            self.cmd_status_lbl.setText("Igniter: auth file missing")
+            return False
+        try:
+            data = json.loads(IGNITER_AUTH_FILE.read_text())
+            salt_hex = data.get("salt_hex", "")
+            hash_hex = data.get("hash_hex", "")
+            iterations = int(data.get("iterations", 120000))
+            if not salt_hex or not hash_hex:
+                return False
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+            candidate = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt, iterations
+            )
+            return hmac.compare_digest(candidate, expected)
+        except Exception:
+            return False
+
+    def _save_calibration(self) -> None:
+        points0 = list(self._calib_points_ch0)
+        points1 = list(self._calib_points_ch1)
+        has_ch0 = len(points0) >= 3
+        has_ch1 = len(points1) >= 3
+        if not has_ch0 and not has_ch1:
+            self.calib_status_lbl.setText("Calib: capture at least 3 points for Ch0 or Ch1")
+            return
+
+        def fit_line(xs: list[float], ys: list[float]) -> tuple[float, float]:
+            n = float(len(xs))
+            sx = sum(xs)
+            sy = sum(ys)
+            sxx = sum(x * x for x in xs)
+            sxy = sum(x * y for x, y in zip(xs, ys))
+            denom = (n * sxx) - (sx * sx)
+            if denom == 0.0:
+                raise ValueError("degenerate calibration points")
+            m = (n * sxy - sx * sy) / denom
+            b = (sy - m * sx) / n
+            return m, b
+
+        ch0_m = ch0_b = None
+        ch1_m = ch1_b = None
+        try:
+            if has_ch0:
+                xs0 = [p.ch0_raw for p in points0]
+                ys0 = [p.weight for p in points0]
+                ch0_m, ch0_b = fit_line(xs0, ys0)
+            if has_ch1:
+                xs1 = [p.ch1_raw for p in points1]
+                ys1 = [p.weight for p in points1]
+                ch1_m, ch1_b = fit_line(xs1, ys1)
+        except Exception as e:
+            self.calib_status_lbl.setText(f"Calib: fit error ({e})")
+            return
+
+        weights = sorted({p.weight for p in points0 + points1})
+        out = {
+            "version": 1,
+            "weights_kg": weights,
+            "points": [
+                {"kg": p.weight, "ch0_raw": p.ch0_raw} for p in points0
+            ],
+            "points_ch1": [
+                {"kg": p.weight, "ch1_raw": p.ch1_raw} for p in points1
+            ],
+            "ch0": {"m": ch0_m, "b": ch0_b},
+            "ch1": {"m": ch1_m, "b": ch1_b},
+        }
+
+        path = Path(self._get_calibration_filename())
+        try:
+            path.write_text(json.dumps(out, indent=2))
+        except Exception as e:
+            self.calib_status_lbl.setText(f"Calib: save failed ({e})")
+            return
+
+        saved = []
+        if ch0_m is not None and ch0_b is not None:
+            saved.append("Ch0")
+        if ch1_m is not None and ch1_b is not None:
+            saved.append("Ch1")
+        saved_text = "/".join(saved) if saved else "none"
+        self.calib_status_lbl.setText(f"Calib: saved {saved_text} → {path.resolve()}")
+        self.calibration_saved.emit()

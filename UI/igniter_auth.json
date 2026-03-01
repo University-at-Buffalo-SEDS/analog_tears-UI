@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "algo": "pbkdf2_sha256",
+  "iterations": 120000,
+  "salt_hex": "9f10670ddf20ec29d1e14edf21678b69",
+  "hash_hex": "55978dce7f0e5565f5deb7483c878e354eb240e29d42f263a1de2b61400c04c1"
+}

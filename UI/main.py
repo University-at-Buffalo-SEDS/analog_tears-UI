@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 import time
 from collections import deque
@@ -34,6 +35,31 @@ class BufferedRow:
     row: list
 
 
+@dataclass(frozen=True)
+class Calibration:
+    ch0_m: Optional[float]
+    ch0_b: Optional[float]
+    ch1_m: Optional[float]
+    ch1_b: Optional[float]
+
+
+def load_calibration(path: Path) -> Optional[Calibration]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        ch0 = data.get("ch0")
+        ch1 = data.get("ch1")
+        return Calibration(
+            ch0_m=float(ch0["m"]) if ch0 and "m" in ch0 else None,
+            ch0_b=float(ch0["b"]) if ch0 and "b" in ch0 else None,
+            ch1_m=float(ch1["m"]) if ch1 and "m" in ch1 else None,
+            ch1_b=float(ch1["b"]) if ch1 and "b" in ch1 else None,
+        )
+    except Exception:
+        return None
+
+
 class RadioWorker(QtCore.QThread):
     """
     Background serial read loop.
@@ -41,14 +67,17 @@ class RadioWorker(QtCore.QThread):
     """
     # t_seconds, ch0(float), ch1(float), internal_adc(int), battery_voltage(float)
     sample = QtCore.pyqtSignal(float, float, float, int, float)
+    raw_sample = QtCore.pyqtSignal(float, float)  # ch0_raw, ch1_raw
     status = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, com_port: str, parent=None):
+    def __init__(self, *, com_port: str, calibration_path: Path, parent=None):
         super().__init__(parent)
         self._com_port = com_port
         self._stop = False
 
         self.radio = Radio(port=self._com_port)
+        self._calibration_path = calibration_path
+        self._calibration: Optional[Calibration] = load_calibration(self._calibration_path)
 
         # --- logging state ---
         self._logging_enabled = False
@@ -113,6 +142,20 @@ class RadioWorker(QtCore.QThread):
     def send_command(self, command: str, on: bool) -> None:
         self.radio.send_command(command, on)
 
+    @QtCore.pyqtSlot()
+    def reload_calibration(self) -> None:
+        self._calibration = load_calibration(self._calibration_path)
+        if self._calibration is None:
+            self.status.emit("Calibration: not loaded (using defaults)")
+        else:
+            self.status.emit("Calibration: loaded")
+            if self._logging_enabled:
+                try:
+                    self._open_csv_if_needed()
+                    self._write_calibration_row()
+                except Exception as e:
+                    self.status.emit(f"Calibration CSV write error: {e}")
+
     # ----------------------------
     # CSV helpers (worker thread)
     # ----------------------------
@@ -140,6 +183,7 @@ class RadioWorker(QtCore.QThread):
                 "Battery Voltage",
                 "CRC",
             ])
+            self._write_calibration_row()
             self._csv_file.flush()
 
         # If we opened a new/different file, we should ensure dedupe structures match.
@@ -186,6 +230,39 @@ class RadioWorker(QtCore.QThread):
             self._written_set = set(self._written_keys)
 
         return True
+
+    def _format_calib_value(self, m: Optional[float], b: Optional[float]) -> str:
+        if m is None or b is None:
+            return ""
+        return f"m={m:.10g},b={b:.10g}"
+
+    def _write_calibration_row(self) -> None:
+        if self._csv_writer is None:
+            return
+        if self._calibration is None:
+            return
+
+        ch0 = self._format_calib_value(self._calibration.ch0_m, self._calibration.ch0_b)
+        ch1 = self._format_calib_value(self._calibration.ch1_m, self._calibration.ch1_b)
+        if not ch0 and not ch1:
+            return
+
+        row = [
+            "CALIBRATION",
+            "",
+            "",
+            "",
+            ch0,
+            ch1,
+            "",
+            "",
+            "",
+        ]
+        self._csv_writer.writerow(row)
+        try:
+            self._csv_file.flush()
+        except Exception:
+            pass
 
     # ----------------------------
     # Main worker loop
@@ -271,10 +348,24 @@ class RadioWorker(QtCore.QThread):
                 # GUI update
                 try:
                     t = time.monotonic() - t0
-                    ch0_kg = (packet.channel0 / 5.831609e-05) - (-21.2) - 54.3
-                    ch1_kg = (packet.channel1 / 2.929497e-06) - (10 - 1.8)
+                    ch0_raw = float(packet.channel0)
+                    ch1_raw = float(packet.channel1)
+                    if self._calibration is None:
+                        ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
+                        ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
+                    else:
+                        if self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
+                            ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
+                        else:
+                            ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
+
+                        if self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
+                            ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
+                        else:
+                            ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
                     iadc = (packet.internal_adc / 1.78)
                     batt_v = float(packet.battery_voltage)
+                    self.raw_sample.emit(ch0_raw, ch1_raw)
                     self.sample.emit(
                         float(t),
                         float(ch0_kg),
@@ -296,11 +387,12 @@ class RadioWorker(QtCore.QThread):
 
 def main():
     COM_PORT = "/dev/tty.usbserial-BG00HPF3"
-    DEFAULT_CSV_FILENAME = "serial_data.csv"
+    DEFAULT_CSV_FILENAME = str(Path(__file__).parent / "Data" / "HTF_Data.csv")
+    CALIBRATION_PATH = Path(__file__).with_name("loadcell_calibration.json")
 
     app = QtWidgets.QApplication(sys.argv)
 
-    worker = RadioWorker(com_port=COM_PORT)
+    worker = RadioWorker(com_port=COM_PORT, calibration_path=CALIBRATION_PATH)
 
     win = MainWindow(history=2000, send_command=worker.send_command)
     win.resize(1100, 860)
@@ -308,14 +400,17 @@ def main():
 
     # Telemetry -> GUI
     worker.sample.connect(win.on_sample)
+    worker.raw_sample.connect(win.on_raw_sample)
 
     # GUI -> Worker logging controls (queued across threads)
     win.start_saving.connect(worker.start_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.stop_saving.connect(worker.stop_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.save_last_10s.connect(worker.save_last_10s, type=QtCore.Qt.ConnectionType.QueuedConnection)
+    win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI
     win.set_filename(DEFAULT_CSV_FILENAME)
+    win.set_calibration_filename(str(CALIBRATION_PATH))
 
     def handle_status(s: str) -> None:
         if s.startswith("ACK:"):
