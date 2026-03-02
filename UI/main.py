@@ -39,8 +39,12 @@ class BufferedRow:
 class Calibration:
     ch0_m: Optional[float]
     ch0_b: Optional[float]
+    ch0_zero_raw: Optional[float]
+    ch0_poly2: Optional[tuple[float, float, float]]
     ch1_m: Optional[float]
     ch1_b: Optional[float]
+    ch1_poly2: Optional[tuple[float, float, float]]
+    ch1_zero_raw: Optional[float]
 
 
 def load_calibration(path: Path) -> Optional[Calibration]:
@@ -50,11 +54,38 @@ def load_calibration(path: Path) -> Optional[Calibration]:
         data = json.loads(path.read_text())
         ch0 = data.get("ch0")
         ch1 = data.get("ch1")
+        ch0_fit = data.get("ch0_fit", {})
+        ch1_fit = data.get("ch1_fit", {})
+        ch0_poly2 = None
+        if isinstance(ch0_fit, dict) and ch0_fit.get("type") == "poly2":
+            try:
+                ch0_poly2 = (
+                    float(ch0_fit["a"]),
+                    float(ch0_fit["b"]),
+                    float(ch0_fit["c"]),
+                )
+            except Exception:
+                ch0_poly2 = None
+        ch1_poly2 = None
+        if isinstance(ch1_fit, dict) and ch1_fit.get("type") == "poly2":
+            try:
+                ch1_poly2 = (
+                    float(ch1_fit["a"]),
+                    float(ch1_fit["b"]),
+                    float(ch1_fit["c"]),
+                )
+            except Exception:
+                ch1_poly2 = None
+
         return Calibration(
             ch0_m=float(ch0["m"]) if ch0 and "m" in ch0 else None,
             ch0_b=float(ch0["b"]) if ch0 and "b" in ch0 else None,
+            ch0_zero_raw=float(data.get("ch0_zero_raw")) if data.get("ch0_zero_raw") is not None else None,
+            ch0_poly2=ch0_poly2,
             ch1_m=float(ch1["m"]) if ch1 and "m" in ch1 else None,
             ch1_b=float(ch1["b"]) if ch1 and "b" in ch1 else None,
+            ch1_poly2=ch1_poly2,
+            ch1_zero_raw=float(data.get("ch1_zero_raw")) if data.get("ch1_zero_raw") is not None else None,
         )
     except Exception:
         return None
@@ -354,13 +385,33 @@ class RadioWorker(QtCore.QThread):
                         ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
                         ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
                     else:
-                        if self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
-                            ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
+                        if self._calibration.ch0_poly2 is not None:
+                            a, b, c = self._calibration.ch0_poly2
+                            if self._calibration.ch0_zero_raw is not None:
+                                x = ch0_raw - self._calibration.ch0_zero_raw
+                                ch0_kg = (a * x * x) + (b * x) + c
+                            else:
+                                ch0_kg = (a * ch0_raw * ch0_raw) + (b * ch0_raw) + c
+                        elif self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
+                            if self._calibration.ch0_zero_raw is not None:
+                                ch0_kg = self._calibration.ch0_m * (ch0_raw - self._calibration.ch0_zero_raw)
+                            else:
+                                ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
                         else:
                             ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
 
-                        if self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
-                            ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
+                        if self._calibration.ch1_poly2 is not None:
+                            a, b, c = self._calibration.ch1_poly2
+                            if self._calibration.ch1_zero_raw is not None:
+                                x = ch1_raw - self._calibration.ch1_zero_raw
+                                ch1_kg = (a * x * x) + (b * x) + c
+                            else:
+                                ch1_kg = (a * ch1_raw * ch1_raw) + (b * ch1_raw) + c
+                        elif self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
+                            if self._calibration.ch1_zero_raw is not None:
+                                ch1_kg = self._calibration.ch1_m * (ch1_raw - self._calibration.ch1_zero_raw)
+                            else:
+                                ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
                         else:
                             ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
                     iadc = (packet.internal_adc / 1.78)

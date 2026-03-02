@@ -80,6 +80,14 @@ class CalibrationEditor(QtWidgets.QWidget):
         points_row.addWidget(self.points_ch1_lbl)
         points_row.addStretch(1)
 
+        fit_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(fit_row)
+        self.ch0_fit_lbl = QtWidgets.QLabel("Ch0 fit: —")
+        fit_row.addWidget(self.ch0_fit_lbl)
+        self.ch1_fit_lbl = QtWidgets.QLabel("Ch1 fit: —")
+        fit_row.addWidget(self.ch1_fit_lbl)
+        fit_row.addStretch(1)
+
         lists_row = QtWidgets.QHBoxLayout()
         layout.addLayout(lists_row)
         self.points_ch0_list = QtWidgets.QListWidget()
@@ -149,6 +157,23 @@ class CalibrationEditor(QtWidgets.QWidget):
         pts1 = data.get("points_ch1", [])
         self.points_ch0_lbl.setText(f"Ch0 points: {len(pts0) if isinstance(pts0, list) else 0}")
         self.points_ch1_lbl.setText(f"Ch1 points: {len(pts1) if isinstance(pts1, list) else 0}")
+
+        ch1_fit = data.get("ch1_fit", {})
+        ch0_fit = data.get("ch0_fit", {})
+        if isinstance(ch0_fit, dict) and ch0_fit.get("type") == "poly2":
+            a = ch0_fit.get("a")
+            b = ch0_fit.get("b")
+            c = ch0_fit.get("c")
+            self.ch0_fit_lbl.setText(f"Ch0 fit: poly2 (a={a}, b={b}, c={c})")
+        else:
+            self.ch0_fit_lbl.setText("Ch0 fit: —")
+        if isinstance(ch1_fit, dict) and ch1_fit.get("type") == "poly2":
+            a = ch1_fit.get("a")
+            b = ch1_fit.get("b")
+            c = ch1_fit.get("c")
+            self.ch1_fit_lbl.setText(f"Ch1 fit: poly2 (a={a}, b={b}, c={c})")
+        else:
+            self.ch1_fit_lbl.setText("Ch1 fit: —")
 
         self.points_ch0_list.clear()
         self.points_ch1_list.clear()

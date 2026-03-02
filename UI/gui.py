@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import math
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,19 @@ class _CalibrationDialog(QtWidgets.QDialog):
         self.list = QtWidgets.QListWidget()
         layout.addWidget(self.list, stretch=1)
 
+        edit_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(edit_row)
+        self.edit_btn = QtWidgets.QPushButton("Edit selected")
+        self.edit_btn.clicked.connect(self._edit_selected)
+        edit_row.addWidget(self.edit_btn)
+        self.delete_btn = QtWidgets.QPushButton("Delete selected")
+        self.delete_btn.clicked.connect(self._delete_selected)
+        edit_row.addWidget(self.delete_btn)
+        self.reset_btn = QtWidgets.QPushButton("Reset sequence")
+        self.reset_btn.clicked.connect(self._reset_sequence)
+        edit_row.addWidget(self.reset_btn)
+        edit_row.addStretch(1)
+
         btn_row = QtWidgets.QHBoxLayout()
         layout.addLayout(btn_row)
 
@@ -87,6 +101,7 @@ class _CalibrationDialog(QtWidgets.QDialog):
         for p in self._points:
             raw = p.ch0_raw if self._channel == 0 else p.ch1_raw
             self.list.addItem(f"{p.weight:g} kg → raw {raw:.6g}")
+        self.finish_btn.setEnabled(len(self._points) >= 3 and not self._capturing)
 
     def _on_next(self) -> None:
         if self._capturing:
@@ -95,19 +110,31 @@ class _CalibrationDialog(QtWidgets.QDialog):
         if not self._points:
             weight = 0.0
         else:
-            w, ok = QtWidgets.QInputDialog.getInt(
-                self,
-                "Next calibration point",
-                "Enter next weight (whole kg):",
-                value=int(self._points[-1].weight),
-                min=0,
-                max=10000,
-                step=1,
-            )
-            if not ok:
+            dlg = QtWidgets.QInputDialog(self)
+            dlg.setWindowTitle("Next calibration point")
+            dlg.setLabelText("Enter next weight (kg):")
+            dlg.setDoubleDecimals(2)
+            dlg.setDoubleRange(0.0, 10000.0)
+            dlg.setDoubleValue(float(self._points[-1].weight))
+            dlg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+
+            def on_accept() -> None:
+                w = dlg.doubleValue()
+                self._begin_capture(float(w))
+
+            def on_reject() -> None:
                 self.status_lbl.setText("Status: canceled")
-                return
-            weight = float(w)
+
+            dlg.accepted.connect(on_accept)
+            dlg.rejected.connect(on_reject)
+            dlg.open()
+            return
+
+        self._begin_capture(weight)
+
+    def _begin_capture(self, weight: float) -> None:
+        if self._capturing:
+            return
 
         prompt = (
             f"Place {weight:g} kg on Ch{self._channel}.\n\n"
@@ -152,6 +179,79 @@ class _CalibrationDialog(QtWidgets.QDialog):
                 )
 
         self._start_capture(self._channel, on_done, on_progress)
+
+    def _edit_selected(self) -> None:
+        if not self._points:
+            self.status_lbl.setText("Status: no points to edit")
+            return
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self._points):
+            self.status_lbl.setText("Status: select a point to edit")
+            return
+        p = self._points[row]
+
+        dlg = QtWidgets.QInputDialog(self)
+        dlg.setWindowTitle("Edit point weight")
+        dlg.setLabelText("Enter weight (kg):")
+        dlg.setDoubleDecimals(2)
+        dlg.setDoubleRange(0.0, 10000.0)
+        dlg.setDoubleValue(float(p.weight))
+        dlg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+
+        def on_accept() -> None:
+            w = float(dlg.doubleValue())
+            if self._channel == 0:
+                self._points[row] = _CalPoint(weight=w, ch0_raw=p.ch0_raw, ch1_raw=0.0)
+            else:
+                self._points[row] = _CalPoint(weight=w, ch0_raw=0.0, ch1_raw=p.ch1_raw)
+            self.status_lbl.setText(f"Status: updated point to {w:g} kg")
+            self._refresh_list()
+
+        def on_reject() -> None:
+            self.status_lbl.setText("Status: edit canceled")
+
+        dlg.accepted.connect(on_accept)
+        dlg.rejected.connect(on_reject)
+        dlg.open()
+
+    def _delete_selected(self) -> None:
+        if not self._points:
+            self.status_lbl.setText("Status: no points to delete")
+            return
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self._points):
+            self.status_lbl.setText("Status: select a point to delete")
+            return
+        p = self._points[row]
+        ok = QtWidgets.QMessageBox.question(
+            self,
+            "Delete point",
+            f"Delete {p.weight:g} kg point?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if ok != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        del self._points[row]
+        self.status_lbl.setText("Status: point deleted")
+        self._refresh_list()
+
+    def _reset_sequence(self) -> None:
+        if not self._points:
+            self.status_lbl.setText("Status: already empty")
+            return
+        ok = QtWidgets.QMessageBox.question(
+            self,
+            "Reset sequence",
+            "Clear all calibration points and restart?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if ok != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._points.clear()
+        self.status_lbl.setText("Status: sequence reset")
+        self._refresh_list()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -905,36 +1005,221 @@ class MainWindow(QtWidgets.QMainWindow):
             b = (sy - m * sx) / n
             return m, b
 
+        def fit_line_through_zero(xs: list[float], ys: list[float]) -> float:
+            denom = sum(x * x for x in xs)
+            if denom == 0.0:
+                raise ValueError("degenerate calibration points")
+            return sum(x * y for x, y in zip(xs, ys)) / denom
+
+        def fit_poly2(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
+            # Least-squares quadratic fit: y = a*x^2 + b*x + c
+            n = float(len(xs))
+            sx = sum(xs)
+            sx2 = sum(x * x for x in xs)
+            sx3 = sum(x * x * x for x in xs)
+            sx4 = sum(x * x * x * x for x in xs)
+            sy = sum(ys)
+            sxy = sum(x * y for x, y in zip(xs, ys))
+            sx2y = sum((x * x) * y for x, y in zip(xs, ys))
+
+            # Solve normal equations using Gaussian elimination
+            a11, a12, a13 = sx4, sx3, sx2
+            a21, a22, a23 = sx3, sx2, sx
+            a31, a32, a33 = sx2, sx, n
+            b1, b2, b3 = sx2y, sxy, sy
+
+            # Forward elimination
+            if a11 == 0.0:
+                raise ValueError("degenerate calibration points")
+            f21 = a21 / a11
+            f31 = a31 / a11
+            a21 -= f21 * a11
+            a22 -= f21 * a12
+            a23 -= f21 * a13
+            b2 -= f21 * b1
+            a31 -= f31 * a11
+            a32 -= f31 * a12
+            a33 -= f31 * a13
+            b3 -= f31 * b1
+
+            if a22 == 0.0:
+                raise ValueError("degenerate calibration points")
+            f32 = a32 / a22
+            a32 -= f32 * a22
+            a33 -= f32 * a23
+            b3 -= f32 * b2
+
+            if a33 == 0.0:
+                raise ValueError("degenerate calibration points")
+
+            # Back substitution
+            c = b3 / a33
+            b = (b2 - a23 * c) / a22
+            a = (b1 - a12 * b - a13 * c) / a11
+            return a, b, c
+
+        def fit_poly2_through_zero(xs: list[float], ys: list[float]) -> tuple[float, float]:
+            # Fit y = a*x^2 + b*x with c=0
+            sx2 = sum(x * x for x in xs)
+            sx3 = sum(x * x * x for x in xs)
+            sx4 = sum(x * x * x * x for x in xs)
+            sxy = sum(x * y for x, y in zip(xs, ys))
+            sx2y = sum((x * x) * y for x, y in zip(xs, ys))
+
+            # Solve 2x2
+            det = sx4 * sx2 - sx3 * sx3
+            if det == 0.0:
+                raise ValueError("degenerate calibration points")
+            a = (sx2y * sx2 - sxy * sx3) / det
+            b = (sx4 * sxy - sx3 * sx2y) / det
+            return a, b
+
+        def sse_line(xs: list[float], ys: list[float], m: float, b: float) -> float:
+            return sum((y - (m * x + b)) ** 2 for x, y in zip(xs, ys))
+
+        def sse_poly2(xs: list[float], ys: list[float], a: float, b: float, c: float) -> float:
+            return sum((y - (a * x * x + b * x + c)) ** 2 for x, y in zip(xs, ys))
+
+        def aic(sse: float, n: int, k: int) -> float:
+            if n <= 0:
+                return float("inf")
+            if sse <= 0.0:
+                sse = 1e-18
+            return n * (math.log(sse / n)) + (2 * k)
+
         ch0_m = ch0_b = None
+        ch0_x0 = None
+        ch0_poly2 = None
+        ch0_fit_type = None
         ch1_m = ch1_b = None
+        ch1_poly2 = None
+        ch1_fit_type = None
+        ch1_x0 = None
         try:
             if has_ch0:
                 xs0 = [p.ch0_raw for p in points0]
                 ys0 = [p.weight for p in points0]
-                ch0_m, ch0_b = fit_line(xs0, ys0)
+                # If 0 kg point exists, force fit through it.
+                zero_points0 = [p for p in points0 if abs(p.weight) < 1e-9]
+                if zero_points0:
+                    ch0_x0 = zero_points0[0].ch0_raw
+                    xs0_shift = [x - ch0_x0 for x in xs0]
+                    ys0_shift = [y - 0.0 for y in ys0]
+                    m0 = fit_line_through_zero(xs0_shift, ys0_shift)
+                    sse_l0 = sse_line(xs0_shift, ys0_shift, m0, 0.0)
+                    aic_l0 = aic(sse_l0, len(xs0_shift), 1)
+
+                    a2, b2 = fit_poly2_through_zero(xs0_shift, ys0_shift)
+                    sse_q0 = sse_poly2(xs0_shift, ys0_shift, a2, b2, 0.0)
+                    aic_q0 = aic(sse_q0, len(xs0_shift), 2)
+
+                    if aic_q0 < aic_l0:
+                        ch0_fit_type = "poly2"
+                        ch0_poly2 = (a2, b2, 0.0)
+                        ch0_m = m0
+                        ch0_b = -m0 * ch0_x0
+                    else:
+                        ch0_fit_type = "linear"
+                        ch0_m = m0
+                        ch0_b = -m0 * ch0_x0
+                else:
+                    ch0_m, ch0_b = fit_line(xs0, ys0)
+                    sse_l0 = sse_line(xs0, ys0, ch0_m, ch0_b)
+                    aic_l0 = aic(sse_l0, len(xs0), 2)
+
+                    ch0_poly2 = fit_poly2(xs0, ys0)
+                    sse_q0 = sse_poly2(xs0, ys0, *ch0_poly2)
+                    aic_q0 = aic(sse_q0, len(xs0), 3)
+
+                    if aic_q0 < aic_l0:
+                        ch0_fit_type = "poly2"
+                    else:
+                        ch0_fit_type = "linear"
             if has_ch1:
                 xs1 = [p.ch1_raw for p in points1]
                 ys1 = [p.weight for p in points1]
-                ch1_m, ch1_b = fit_line(xs1, ys1)
+                zero_points1 = [p for p in points1 if abs(p.weight) < 1e-9]
+                if zero_points1:
+                    ch1_x0 = zero_points1[0].ch1_raw
+                    xs1_shift = [x - ch1_x0 for x in xs1]
+                    ys1_shift = [y - 0.0 for y in ys1]
+                    # Evaluate linear vs quadratic on shifted data, forcing intercept 0
+                    m0 = fit_line_through_zero(xs1_shift, ys1_shift)
+                    sse_l = sse_line(xs1_shift, ys1_shift, m0, 0.0)
+                    aic_l = aic(sse_l, len(xs1_shift), 1)
+
+                    a2, b2 = fit_poly2_through_zero(xs1_shift, ys1_shift)
+                    sse_q = sse_poly2(xs1_shift, ys1_shift, a2, b2, 0.0)
+                    aic_q = aic(sse_q, len(xs1_shift), 2)
+
+                    if aic_q < aic_l:
+                        ch1_fit_type = "poly2"
+                        ch1_poly2 = (a2, b2, 0.0)
+                        # Also keep linear fallback mapped to original x
+                        ch1_m = m0
+                        ch1_b = -m0 * ch1_x0
+                    else:
+                        ch1_fit_type = "linear"
+                        ch1_m = m0
+                        ch1_b = -m0 * ch1_x0
+                else:
+                    # Evaluate linear vs quadratic and pick best by AIC (free intercept)
+                    ch1_m, ch1_b = fit_line(xs1, ys1)
+                    sse_l = sse_line(xs1, ys1, ch1_m, ch1_b)
+                    aic_l = aic(sse_l, len(xs1), 2)
+
+                    ch1_poly2 = fit_poly2(xs1, ys1)
+                    sse_q = sse_poly2(xs1, ys1, *ch1_poly2)
+                    aic_q = aic(sse_q, len(xs1), 3)
+
+                    if aic_q < aic_l:
+                        ch1_fit_type = "poly2"
+                    else:
+                        ch1_fit_type = "linear"
         except Exception as e:
             self.calib_status_lbl.setText(f"Calib: fit error ({e})")
             return
 
-        weights = sorted({p.weight for p in points0 + points1})
-        out = {
-            "version": 1,
-            "weights_kg": weights,
-            "points": [
-                {"kg": p.weight, "ch0_raw": p.ch0_raw} for p in points0
-            ],
-            "points_ch1": [
-                {"kg": p.weight, "ch1_raw": p.ch1_raw} for p in points1
-            ],
-            "ch0": {"m": ch0_m, "b": ch0_b},
-            "ch1": {"m": ch1_m, "b": ch1_b},
-        }
-
         path = Path(self._get_calibration_filename())
+        # Merge with existing file if present to avoid overwriting channels without data.
+        if path.exists():
+            try:
+                out = json.loads(path.read_text())
+            except Exception:
+                out = {}
+        else:
+            out = {}
+
+        out["version"] = 1
+
+        if has_ch0:
+            out["ch0"] = {"m": ch0_m, "b": ch0_b}
+            out["points"] = [{"kg": p.weight, "ch0_raw": p.ch0_raw} for p in points0]
+            if ch0_x0 is not None:
+                out["ch0_zero_raw"] = ch0_x0
+            if ch0_poly2 is not None and ch0_fit_type == "poly2":
+                a, b, c = ch0_poly2
+                out["ch0_fit"] = {"type": "poly2", "a": a, "b": b, "c": c, "x0": ch0_x0}
+            else:
+                out["ch0_fit"] = {"type": "linear", "x0": ch0_x0}
+        if has_ch1:
+            out["ch1"] = {"m": ch1_m, "b": ch1_b}
+            out["points_ch1"] = [{"kg": p.weight, "ch1_raw": p.ch1_raw} for p in points1]
+            if ch1_x0 is not None:
+                out["ch1_zero_raw"] = ch1_x0
+            if ch1_poly2 is not None and ch1_fit_type == "poly2":
+                a, b, c = ch1_poly2
+                out["ch1_fit"] = {"type": "poly2", "a": a, "b": b, "c": c, "x0": ch1_x0}
+            else:
+                out["ch1_fit"] = {"type": "linear", "x0": ch1_x0}
+
+        all_weights = []
+        if has_ch0:
+            all_weights.extend([p.weight for p in points0])
+        if has_ch1:
+            all_weights.extend([p.weight for p in points1])
+        out["weights_kg"] = sorted({w for w in all_weights})
+
         try:
             path.write_text(json.dumps(out, indent=2))
         except Exception as e:
