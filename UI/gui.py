@@ -140,45 +140,51 @@ class _CalibrationDialog(QtWidgets.QDialog):
             f"Place {weight:g} kg on Ch{self._channel}.\n\n"
             f"Keep the load steady, then click OK to capture {self._samples_per_point} samples."
         )
-        ok = QtWidgets.QMessageBox.question(
-            self,
-            f"Calibrate Ch{self._channel}",
-            prompt,
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.Yes,
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle(f"Calibrate Ch{self._channel}")
+        msg.setText(prompt)
+        msg.setStandardButtons(
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
         )
-        if ok != QtWidgets.QMessageBox.StandardButton.Yes:
-            self.status_lbl.setText("Status: canceled")
-            return
+        msg.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Yes)
+        msg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
 
-        self._capturing = True
-        self._current_weight = weight
-        self.next_btn.setEnabled(False)
-        self.finish_btn.setEnabled(False)
-        self.status_lbl.setText(
-            f"Status: capturing {self._samples_per_point} samples at {weight:g} kg..."
-        )
+        def on_result(result: int) -> None:
+            if result != int(QtWidgets.QMessageBox.StandardButton.Yes):
+                self.status_lbl.setText("Status: canceled")
+                return
 
-        def on_done(avg_raw: float) -> None:
-            if self._channel == 0:
-                self._points.append(_CalPoint(weight=weight, ch0_raw=avg_raw, ch1_raw=0.0))
-            else:
-                self._points.append(_CalPoint(weight=weight, ch0_raw=0.0, ch1_raw=avg_raw))
+            self._capturing = True
+            self._current_weight = weight
+            self.next_btn.setEnabled(False)
+            self.finish_btn.setEnabled(False)
+            self.status_lbl.setText(
+                f"Status: capturing {self._samples_per_point} samples at {weight:g} kg..."
+            )
 
-            self._capturing = False
-            self._current_weight = None
-            self.next_btn.setEnabled(True)
-            self.finish_btn.setEnabled(len(self._points) >= 3)
-            self.status_lbl.setText(f"Status: captured {weight:g} kg (avg raw={avg_raw:.6g})")
-            self._refresh_list()
+            def on_done(avg_raw: float) -> None:
+                if self._channel == 0:
+                    self._points.append(_CalPoint(weight=weight, ch0_raw=avg_raw, ch1_raw=0.0))
+                else:
+                    self._points.append(_CalPoint(weight=weight, ch0_raw=0.0, ch1_raw=avg_raw))
 
-        def on_progress(count: int, total: int) -> None:
-            if self._capturing and self._current_weight is not None:
-                self.status_lbl.setText(
-                    f"Status: capturing {count}/{total} samples at {self._current_weight:g} kg..."
-                )
+                self._capturing = False
+                self._current_weight = None
+                self.next_btn.setEnabled(True)
+                self.finish_btn.setEnabled(len(self._points) >= 3)
+                self.status_lbl.setText(f"Status: captured {weight:g} kg (avg raw={avg_raw:.6g})")
+                self._refresh_list()
 
-        self._start_capture(self._channel, on_done, on_progress)
+            def on_progress(count: int, total: int) -> None:
+                if self._capturing and self._current_weight is not None:
+                    self.status_lbl.setText(
+                        f"Status: capturing {count}/{total} samples at {self._current_weight:g} kg..."
+                    )
+
+            self._start_capture(self._channel, on_done, on_progress)
+
+        msg.finished.connect(on_result)
+        msg.open()
 
     def _edit_selected(self) -> None:
         if not self._points:
