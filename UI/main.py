@@ -154,6 +154,8 @@ class RadioWorker(QtCore.QThread):
         self._logging_enabled = False
         self._logging_paused = False
         self._close_csv()
+        # Return to low-latency display mode after save sessions end.
+        self._csv_path = None
         self.status.emit("Saving: OFF")
 
     @QtCore.pyqtSlot(bool)
@@ -186,6 +188,11 @@ class RadioWorker(QtCore.QThread):
         for br in rows:
             if self._write_row_dedup(br.key, br.row):
                 wrote += 1
+
+        # Snapshot writes should not force persistent non-display-only mode.
+        if not self._logging_enabled:
+            self._close_csv()
+            self._csv_path = None
 
         self.status.emit(f"Saved last 10s: wrote {wrote} row(s) → {path.resolve()}")
 
@@ -229,8 +236,9 @@ class RadioWorker(QtCore.QThread):
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
             if self._low_latency_display_mode:
-                self.radio.drop_os_backlog_if_needed(256)
-                self.radio.prune_rx_buffer_to_latest(256)
+                # Keep latency low, but avoid over-aggressive flushing that can starve decoding.
+                self.radio.drop_os_backlog_if_needed(8192)
+                self.radio.prune_rx_buffer_to_latest(4096)
             try:
                 ev = self.radio.poll_event()
             except Exception:
@@ -474,7 +482,7 @@ class RadioWorker(QtCore.QThread):
                         self.raw_sample.emit(float(t_mono), ch0_raw, ch1_raw)
                         last_raw_emit = t_mono
 
-                    if (t_mono - last_ui_emit) >= ui_emit_period and (not self._ui_emit_in_flight):
+                    if (t_mono - last_ui_emit) >= ui_emit_period:
                         if self._calibration is None:
                             ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
                             ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
@@ -517,7 +525,6 @@ class RadioWorker(QtCore.QThread):
                             int(iadc),
                             batt_v,
                         )
-                        self._ui_emit_in_flight = True
                         last_ui_emit = t_mono
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
@@ -548,7 +555,8 @@ def main():
 
     worker = RadioWorker(com_port=COM_PORT, calibration_path=CALIBRATION_PATH, baudrate=BAUDRATE)
 
-    win = MainWindow(history=2000, send_command=worker.send_command)
+    # Keep enough samples for long time windows at high refresh rates.
+    win = MainWindow(history=120000, send_command=worker.send_command)
     win.resize(1100, 860)
     win.showMaximized()
 

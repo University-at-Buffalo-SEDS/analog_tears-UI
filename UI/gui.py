@@ -278,7 +278,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
         *,
-        history: int = 5000,  # max samples stored (raw + filtered)
+        history: int = 120000,  # max samples stored (raw + filtered)
         initial_window_seconds: float = 10.0,
         send_command: Optional[Callable[[str, bool], object]] = None,
         parent=None,
@@ -410,7 +410,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Window size slider (affects view only)
         controls.addWidget(QtWidgets.QLabel("Window (s):"))
         self.window_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.window_slider.setRange(5, 120)
+        self.window_slider.setRange(5, 600)
         self.window_slider.setValue(int(self._window_seconds))
         self.window_slider.setFixedWidth(200)
         self.window_slider.valueChanged.connect(self._on_window_changed)

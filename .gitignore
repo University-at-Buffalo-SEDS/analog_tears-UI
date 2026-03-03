@@ -7,3 +7,4 @@ env/
 UI/serial_data.csv
 
 .DS_Store
+/UI/Data/
