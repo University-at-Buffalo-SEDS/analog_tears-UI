@@ -577,10 +577,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calib_ch1_btn.clicked.connect(self._reload_calibration_from_file)
         calib_row.addWidget(self.calib_ch1_btn)
 
-        self.calib_reset_btn = QtWidgets.QPushButton("Reset points")
-        self.calib_reset_btn.clicked.connect(self._reset_calibration_points)
-        calib_row.addWidget(self.calib_reset_btn)
-
         calib_row.addStretch(1)
 
         self.calib_status_lbl = QtWidgets.QLabel("Calib: —")
@@ -655,11 +651,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_calibration_filename_edited(self) -> None:
         self._refresh_calibration_watch()
         self.calibration_saved.emit()
-        self.calib_status_lbl.setText("Calib: config path updated and reloaded")
+        self.calib_status_lbl.setText("Calib: config path updated, reload requested")
 
     def _on_calibration_file_changed(self, _path: str) -> None:
         self.calibration_saved.emit()
-        self.calib_status_lbl.setText("Calib: auto-reloaded from calibration UI save")
+        self.calib_status_lbl.setText("Calib: auto reload requested (config changed)")
         QtCore.QTimer.singleShot(150, self._refresh_calibration_watch)
 
     def _sync_saving_ui(self) -> None:
@@ -1266,6 +1262,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_saved.emit()
         self._refresh_calibration_watch()
         self.calib_status_lbl.setText("Calib: reload requested")
+
+    def on_calibration_reload_status(self, loaded: bool) -> None:
+        if loaded:
+            self.calib_status_lbl.setText("Calib: reload succeeded")
+        else:
+            self.calib_status_lbl.setText("Calib: reload failed (using defaults)")
 
     def _open_calibration_dialog(self, channel: int) -> None:
         if self._active_calib_dialog is not None:

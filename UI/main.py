@@ -52,6 +52,7 @@ class Calibration:
     ch1_zero_raw: Optional[float]
     iadc_m: Optional[float]
     iadc_b: Optional[float]
+    iadc_zero_raw: Optional[float]
 
 
 def load_calibration(path: Path) -> Optional[Calibration]:
@@ -96,6 +97,7 @@ def load_calibration(path: Path) -> Optional[Calibration]:
             ch1_zero_raw=float(data.get("ch1_zero_raw")) if data.get("ch1_zero_raw") is not None else None,
             iadc_m=float(iadc["m"]) if iadc and "m" in iadc else None,
             iadc_b=float(iadc["b"]) if iadc and "b" in iadc else None,
+            iadc_zero_raw=float(data.get("iadc_zero_raw")) if data.get("iadc_zero_raw") is not None else None,
         )
     except Exception:
         return None
@@ -455,6 +457,8 @@ class RadioWorker(QtCore.QThread):
 
     def _calibrate_tank_pressure(self, iadc_raw: float) -> float:
         if self._calibration is not None and self._calibration.iadc_m is not None and self._calibration.iadc_b is not None:
+            if self._calibration.iadc_zero_raw is not None:
+                return float(self._calibration.iadc_m * (iadc_raw - self._calibration.iadc_zero_raw))
             return float(self._calibration.iadc_m * iadc_raw + self._calibration.iadc_b)
         return float(iadc_raw / 1.78)
 
@@ -737,6 +741,12 @@ def main():
     def handle_status(s: str) -> None:
         if s.startswith("ACK:"):
             win.cmd_status_lbl.setText(s)
+        elif s.startswith("Calibration: loaded"):
+            win.on_calibration_reload_status(True)
+            win.setWindowTitle(f"Serial Telemetry Viewer — {s}")
+        elif s.startswith("Calibration: not loaded"):
+            win.on_calibration_reload_status(False)
+            win.setWindowTitle(f"Serial Telemetry Viewer — {s}")
         else:
             win.setWindowTitle(f"Serial Telemetry Viewer — {s}")
 

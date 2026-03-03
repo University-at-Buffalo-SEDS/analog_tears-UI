@@ -235,6 +235,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._points2_xy: list[tuple[float, float]] = []
         self._ch0_fit_meta: dict[str, Any] | None = None
         self._ch1_fit_meta: dict[str, Any] | None = None
+        self._iadc_fit_meta: dict[str, Any] | None = None
         self._raw_port = raw_port
         self._raw_sock: socket.socket | None = None
         self._raw_timer: QtCore.QTimer | None = None
@@ -300,6 +301,11 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.ch1_zero = QtWidgets.QLineEdit()
         self.ch1_zero.setFixedWidth(160)
         zero_row.addWidget(self.ch1_zero)
+        zero_row.addSpacing(20)
+        zero_row.addWidget(QtWidgets.QLabel("Zero raw TankP:"))
+        self.iadc_zero = QtWidgets.QLineEdit()
+        self.iadc_zero.setFixedWidth(160)
+        zero_row.addWidget(self.iadc_zero)
         zero_row.addStretch(1)
 
         info_row = QtWidgets.QHBoxLayout()
@@ -435,8 +441,10 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         self.ch0_zero.setText("" if data.get("ch0_zero_raw") is None else str(data.get("ch0_zero_raw")))
         self.ch1_zero.setText("" if data.get("ch1_zero_raw") is None else str(data.get("ch1_zero_raw")))
+        self.iadc_zero.setText("" if data.get("iadc_zero_raw") is None else str(data.get("iadc_zero_raw")))
         self._sequence_started[0] = data.get("ch0_zero_raw") is not None
         self._sequence_started[1] = data.get("ch1_zero_raw") is not None
+        self._sequence_started[2] = data.get("iadc_zero_raw") is not None
         self._update_sequence_status_label()
 
         pts0 = data.get("points", [])
@@ -444,13 +452,29 @@ class CalibrationEditor(QtWidgets.QWidget):
         pts2 = data.get("points_iadc", [])
         ch1_fit = data.get("ch1_fit", {})
         ch0_fit = data.get("ch0_fit", {})
+        iadc_fit = data.get("iadc_fit", {})
+        ch0_m = _get_float(self.ch0_m.text())
+        ch0_b = _get_float(self.ch0_b.text())
+        ch1_m = _get_float(self.ch1_m.text())
+        ch1_b = _get_float(self.ch1_b.text())
+        iadc_m = _get_float(self.iadc_m.text())
+        iadc_b = _get_float(self.iadc_b.text())
         self._ch0_fit_meta = ch0_fit if isinstance(ch0_fit, dict) else None
         self._ch1_fit_meta = ch1_fit if isinstance(ch1_fit, dict) else None
+        self._iadc_fit_meta = iadc_fit if isinstance(iadc_fit, dict) else None
+        if self._ch0_fit_meta is None and ch0_m is not None and ch0_b is not None:
+            self._ch0_fit_meta = {"type": "linear", "x0": _get_float(self.ch0_zero.text())}
+        if self._ch1_fit_meta is None and ch1_m is not None and ch1_b is not None:
+            self._ch1_fit_meta = {"type": "linear", "x0": _get_float(self.ch1_zero.text())}
+        if self._iadc_fit_meta is None and iadc_m is not None and iadc_b is not None:
+            self._iadc_fit_meta = {"type": "linear", "x0": _get_float(self.iadc_zero.text())}
         if isinstance(ch0_fit, dict) and ch0_fit.get("type") == "poly2":
             a = ch0_fit.get("a")
             b = ch0_fit.get("b")
             c = ch0_fit.get("c")
             self.ch0_fit_lbl.setText(f"50kg fit: poly2 (a={a}, b={b}, c={c})")
+        elif isinstance(ch0_fit, dict) and ch0_fit.get("type") == "linear":
+            self.ch0_fit_lbl.setText("50kg fit: linear")
         else:
             self.ch0_fit_lbl.setText("50kg fit: —")
         if isinstance(ch1_fit, dict) and ch1_fit.get("type") == "poly2":
@@ -458,8 +482,21 @@ class CalibrationEditor(QtWidgets.QWidget):
             b = ch1_fit.get("b")
             c = ch1_fit.get("c")
             self.ch1_fit_lbl.setText(f"1000kg fit: poly2 (a={a}, b={b}, c={c})")
+        elif isinstance(ch1_fit, dict) and ch1_fit.get("type") == "linear":
+            self.ch1_fit_lbl.setText("1000kg fit: linear")
         else:
             self.ch1_fit_lbl.setText("1000kg fit: —")
+        if isinstance(iadc_fit, dict) and iadc_fit.get("type") == "poly2":
+            a = iadc_fit.get("a")
+            b = iadc_fit.get("b")
+            c = iadc_fit.get("c")
+            self.iadc_fit_lbl.setText(f"Tank pressure fit: poly2 (a={a}, b={b}, c={c})")
+        elif isinstance(iadc_fit, dict) and iadc_fit.get("type") == "linear":
+            self.iadc_fit_lbl.setText("Tank pressure fit: linear")
+        elif _get_float(self.iadc_m.text()) is not None and _get_float(self.iadc_b.text()) is not None:
+            self.iadc_fit_lbl.setText("Tank pressure fit: linear")
+        else:
+            self.iadc_fit_lbl.setText("Tank pressure fit: —")
 
         self._points0_xy = []
         self._points1_xy = []
@@ -589,6 +626,7 @@ class CalibrationEditor(QtWidgets.QWidget):
             self.ch1_zero.setText("")
         else:
             self._points2_xy.clear()
+            self.iadc_zero.setText("")
         self._sequence_started[ch] = False
         self.status_lbl.setText(f"Status: reset {self._channel_name(ch)} points and sequence")
         self._refresh_points_lists()
@@ -658,6 +696,8 @@ class CalibrationEditor(QtWidgets.QWidget):
                             self.ch0_zero.setText(str(avg))
                         elif self._capture_channel == 1:
                             self.ch1_zero.setText(str(avg))
+                        else:
+                            self.iadc_zero.setText(str(avg))
                         self._sequence_started[self._capture_channel] = True
                     self._capture_active = False
                     self._capture_vals.clear()
@@ -798,10 +838,19 @@ class CalibrationEditor(QtWidgets.QWidget):
             if len(self._points2_xy) >= 2:
                 xs2 = [x for x, _ in self._points2_xy]
                 ys2 = [y for _, y in self._points2_xy]
-                m2, b2 = fit_line(xs2, ys2)
+                zero_candidates2 = [x for x, y in self._points2_xy if abs(y) < 1e-9]
+                if zero_candidates2:
+                    x0 = float(zero_candidates2[0])
+                    xs2_shift = [x - x0 for x in xs2]
+                    m2 = fit_line_through_zero(xs2_shift, ys2)
+                    b2 = 0.0
+                    self.iadc_zero.setText(str(x0))
+                else:
+                    m2, b2 = fit_line(xs2, ys2)
                 self.iadc_m.setText(str(m2))
                 self.iadc_b.setText(str(b2))
                 self.iadc_fit_lbl.setText("Tank pressure fit: linear")
+                self._iadc_fit_meta = {"type": "linear", "x0": _get_float(self.iadc_zero.text())}
         except Exception as e:
             self.status_lbl.setText(f"Status: refit failed ({e})")
             return
@@ -860,6 +909,7 @@ class CalibrationEditor(QtWidgets.QWidget):
             ch1_b = _get_float(self.ch1_b.text())
             iadc_m = _get_float(self.iadc_m.text())
             iadc_b = _get_float(self.iadc_b.text())
+            iadc_zero = _get_float(self.iadc_zero.text())
             ch0_zero = _get_float(self.ch0_zero.text())
             ch1_zero = _get_float(self.ch1_zero.text())
         except Exception as e:
@@ -875,6 +925,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._data.setdefault("iadc", {})
         self._data["iadc"]["m"] = iadc_m
         self._data["iadc"]["b"] = iadc_b
+        self._data["iadc_zero_raw"] = iadc_zero
         self._data["ch0_zero_raw"] = ch0_zero
         self._data["ch1_zero_raw"] = ch1_zero
         self._data["points"] = [{"kg": kg, "ch0_raw": raw} for raw, kg in self._points0_xy]
@@ -887,6 +938,8 @@ class CalibrationEditor(QtWidgets.QWidget):
             self._data["ch0_fit"] = self._ch0_fit_meta
         if isinstance(self._ch1_fit_meta, dict):
             self._data["ch1_fit"] = self._ch1_fit_meta
+        if isinstance(self._iadc_fit_meta, dict):
+            self._data["iadc_fit"] = self._iadc_fit_meta
 
         try:
             if self.backup_chk.isChecked():
