@@ -37,7 +37,8 @@ class _CalibrationDialog(QtWidgets.QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(f"Calibrate Ch{channel}")
-        self.setModal(True)
+        self.setModal(False)
+        self.setWindowModality(QtCore.Qt.WindowModality.NonModal)
         self.resize(420, 320)
 
         self._channel = channel
@@ -296,8 +297,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_stats_refresh_mono = 0.0
         self._max_sample_lag_s = 0.200
         self._max_raw_lag_s = 0.300
+        self._no_data_synth_delay_s = 0.100
         self._stream_t0_mono: Optional[float] = None
         self._latest_sample: Optional[tuple[float, float, float, int, float]] = None
+        self._last_real_sample: Optional[tuple[float, float, float, int, float]] = None
+        self._prev_real_sample: Optional[tuple[float, float, float, int, float]] = None
+        self._active_calib_dialog: Optional[_CalibrationDialog] = None
 
         # Filter settings
         self._filter_enabled = True
@@ -333,7 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Calibration state
         self._calib_points_ch0: list[_CalPoint] = []
         self._calib_points_ch1: list[_CalPoint] = []
-        self._calib_samples_per_point = 50
+        self._calib_samples_per_point = 200
         self._calib_pending_channel: Optional[int] = None
         self._calib_pending_samples: list[float] = []
         self._calib_pending_callback = None
@@ -779,6 +784,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_filter_state()
         self._stream_t0_mono = None
         self._latest_sample = None
+        self._last_real_sample = None
+        self._prev_real_sample = None
         self._last_plot_refresh_mono = 0.0
         self._last_stats_refresh_mono = 0.0
         self._update_labels()
@@ -903,47 +910,80 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.sample_consumed.emit()
 
-    def _consume_latest_sample(self) -> None:
-        if self._paused:
-            self._latest_sample = None
-            return
-        if self._latest_sample is None:
-            return
-
-        t_mono, ch0, ch1, internal_adc, battery_voltage = self._latest_sample
-        self._latest_sample = None
-
-        now_mono = time.monotonic()
-        if (now_mono - t_mono) > self._max_sample_lag_s:
-            return
+    def _append_processed_sample(
+        self,
+        t_mono: float,
+        ch0: float,
+        ch1: float,
+        internal_adc: int,
+        battery_voltage: float,
+    ) -> None:
         if self._stream_t0_mono is None:
             self._stream_t0_mono = t_mono
         t_seconds = t_mono - self._stream_t0_mono
 
         self._xs.append(float(t_seconds))
-        self._raw_ch0.append(ch0)
-        self._raw_ch1.append(ch1)
-        self._raw_iadc.append(internal_adc)
-        self._raw_batt.append(battery_voltage)
+        self._raw_ch0.append(float(ch0))
+        self._raw_ch1.append(float(ch1))
+        self._raw_iadc.append(int(internal_adc))
+        self._raw_batt.append(float(battery_voltage))
 
         a = self._ema_alpha
         if self._ema_ch0 is None:
-            self._ema_ch0 = ch0
-            self._ema_ch1 = ch1
+            self._ema_ch0 = float(ch0)
+            self._ema_ch1 = float(ch1)
             self._ema_iadc = float(internal_adc)
-            self._ema_batt = battery_voltage
+            self._ema_batt = float(battery_voltage)
         else:
-            self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * ch0
-            self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * ch1
+            self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * float(ch0)
+            self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * float(ch1)
             self._ema_iadc = (1.0 - a) * self._ema_iadc + a * float(internal_adc)
-            self._ema_batt = (1.0 - a) * self._ema_batt + a * battery_voltage
+            self._ema_batt = (1.0 - a) * self._ema_batt + a * float(battery_voltage)
 
         self._flt_ch0.append(float(self._ema_ch0))
         self._flt_ch1.append(float(self._ema_ch1))
         self._flt_iadc.append(int(round(self._ema_iadc)))
         self._flt_batt.append(float(self._ema_batt))
 
+    def _consume_latest_sample(self) -> None:
+        if self._paused:
+            self._latest_sample = None
+            return
         now = time.monotonic()
+        used_sample = False
+
+        if self._latest_sample is not None:
+            t_mono, ch0, ch1, internal_adc, battery_voltage = self._latest_sample
+            self._latest_sample = None
+            if (now - t_mono) <= self._max_sample_lag_s:
+                self._append_processed_sample(t_mono, ch0, ch1, internal_adc, battery_voltage)
+                self._prev_real_sample = self._last_real_sample
+                self._last_real_sample = (t_mono, ch0, ch1, internal_adc, battery_voltage)
+                used_sample = True
+
+        if (not used_sample) and (self._last_real_sample is not None):
+            last_t, last_c0, last_c1, last_iadc, last_batt = self._last_real_sample
+            if (now - last_t) >= self._no_data_synth_delay_s:
+                slope_c0 = slope_c1 = slope_iadc = slope_batt = 0.0
+                if self._prev_real_sample is not None:
+                    prev_t, prev_c0, prev_c1, prev_iadc, prev_batt = self._prev_real_sample
+                    dt = last_t - prev_t
+                    if dt > 1e-6:
+                        slope_c0 = (last_c0 - prev_c0) / dt
+                        slope_c1 = (last_c1 - prev_c1) / dt
+                        slope_iadc = (float(last_iadc) - float(prev_iadc)) / dt
+                        slope_batt = (last_batt - prev_batt) / dt
+                dt_now = now - last_t
+                synth_c0 = last_c0 + slope_c0 * dt_now
+                synth_c1 = last_c1 + slope_c1 * dt_now
+                synth_iadc = int(round(float(last_iadc) + slope_iadc * dt_now))
+                synth_batt = last_batt + slope_batt * dt_now
+                self._append_processed_sample(now, synth_c0, synth_c1, synth_iadc, synth_batt)
+                used_sample = True
+
+        if not used_sample:
+            return
+
         self._redraw()
         self._last_plot_refresh_mono = now
         if (now - self._last_stats_refresh_mono) >= self._stats_refresh_interval_s:
@@ -953,8 +993,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(float, float, float)
     def on_raw_sample(self, t_mono: float, ch0_raw: float, ch1_raw: float) -> None:
-        if (time.monotonic() - float(t_mono)) > self._max_raw_lag_s:
-            return
+        _ = t_mono  # timestamp retained in signal for future tuning
         self._raw_ch0_recent.append(float(ch0_raw))
         self._raw_ch1_recent.append(float(ch1_raw))
 
@@ -982,7 +1021,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._calib_pending_samples.clear()
             self._calib_pending_callback = None
             self._calib_pending_progress_cb = None
-            self.raw_stream_enabled.emit(False)
             if cb is not None:
                 cb(avg)
             if pcb is not None:
@@ -992,6 +1030,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # Calibration helpers
     # -------------------------------------------------
     def _open_calibration_dialog(self, channel: int) -> None:
+        if self._active_calib_dialog is not None:
+            self._active_calib_dialog.raise_()
+            self._active_calib_dialog.activateWindow()
+            return
+
         points = self._calib_points_ch0 if channel == 0 else self._calib_points_ch1
         self.raw_stream_enabled.emit(True)
 
@@ -1002,6 +1045,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if len(self._raw_ch0_recent) < 5 or len(self._raw_ch1_recent) < 5:
                 self.calib_status_lbl.setText("Calib: not enough samples yet")
                 return
+            self.raw_stream_enabled.emit(True)
             self._calib_pending_channel = ch
             self._calib_pending_samples.clear()
             self._calib_pending_callback = done_cb
@@ -1014,17 +1058,29 @@ class MainWindow(QtWidgets.QMainWindow):
             existing_points=points,
             parent=self,
         )
-        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            new_points = dlg.points()
-            if channel == 0:
-                self._calib_points_ch0 = new_points
-            else:
-                self._calib_points_ch1 = new_points
-            self.calib_status_lbl.setText(
-                f"Calib: Ch{channel} points set ({len(new_points)} point(s))"
-            )
-        if self._calib_pending_channel is None:
+        self._active_calib_dialog = dlg
+
+        def on_finished(result: int) -> None:
+            if result == int(QtWidgets.QDialog.DialogCode.Accepted):
+                new_points = dlg.points()
+                if channel == 0:
+                    self._calib_points_ch0 = new_points
+                else:
+                    self._calib_points_ch1 = new_points
+                self.calib_status_lbl.setText(
+                    f"Calib: Ch{channel} points set ({len(new_points)} point(s))"
+                )
+            # Ensure calibration capture state is always reset on dialog exit.
+            self._calib_pending_channel = None
+            self._calib_pending_samples.clear()
+            self._calib_pending_callback = None
+            self._calib_pending_progress_cb = None
             self.raw_stream_enabled.emit(False)
+            self._active_calib_dialog = None
+            dlg.deleteLater()
+
+        dlg.finished.connect(on_finished)
+        dlg.open()
 
     def _verify_igniter_password(self, password: str) -> bool:
         if not IGNITER_AUTH_FILE.exists():
