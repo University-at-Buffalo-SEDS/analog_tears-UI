@@ -269,6 +269,7 @@ class MainWindow(QtWidgets.QMainWindow):
     save_last_10s = QtCore.pyqtSignal(str)    # filename
     calibration_saved = QtCore.pyqtSignal()
     raw_stream_enabled = QtCore.pyqtSignal(bool)
+    sample_consumed = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -900,6 +901,7 @@ class MainWindow(QtWidgets.QMainWindow):
             int(internal_adc),
             float(battery_voltage),
         )
+        self.sample_consumed.emit()
 
     def _consume_latest_sample(self) -> None:
         if self._paused:

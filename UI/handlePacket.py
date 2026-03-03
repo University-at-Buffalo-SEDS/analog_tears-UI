@@ -1,6 +1,7 @@
 # handlePacket.py
 from __future__ import annotations
 
+import binascii
 import struct
 
 from packet import DataPacket
@@ -45,6 +46,10 @@ class PacketHandler:
 
     @staticmethod
     def crc16(data: bytes) -> int:
+        # Fast path in C for CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect, xorout 0x0000)
+        if not PacketHandler.CRC16_REFLECT:
+            return (binascii.crc_hqx(data, PacketHandler.CRC16_INIT & 0xFFFF) ^ PacketHandler.CRC16_XOROUT) & 0xFFFF
+
         crc = PacketHandler.CRC16_INIT & 0xFFFF
         poly = PacketHandler.CRC16_POLY & 0xFFFF
 
@@ -70,7 +75,7 @@ class PacketHandler:
         return (crc ^ PacketHandler.CRC16_XOROUT) & 0xFFFF
 
     @staticmethod
-    def decode_packet(data: bytes) -> DataPacket | None:
+    def decode_packet(data: bytes, *, verify_crc: bool = True) -> DataPacket | None:
         try:
             if len(data) != PacketHandler.PACKET_SIZE:
                 raise ValueError(
@@ -90,9 +95,10 @@ class PacketHandler:
                 data,
             )
 
-            calc_crc = PacketHandler.crc16(data[:-2])
-            if (crc & 0xFFFF) != calc_crc:
-                raise ValueError(f"CRC mismatch: got 0x{crc:04X}, expected 0x{calc_crc:04X}")
+            if verify_crc:
+                calc_crc = PacketHandler.crc16(data[:-2])
+                if (crc & 0xFFFF) != calc_crc:
+                    raise ValueError(f"CRC mismatch: got 0x{crc:04X}, expected 0x{calc_crc:04X}")
 
             return DataPacket(
                 header=header,

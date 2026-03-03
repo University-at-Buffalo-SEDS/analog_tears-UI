@@ -48,6 +48,7 @@ class Radio:
 
         # Status print throttle (optional)
         self._last_err_print = 0.0
+        self._verify_crc = True
 
         if not self.simulate:
             self.ser = None
@@ -114,7 +115,7 @@ class Radio:
         if len(self._rx_buf) < PacketHandler.PACKET_SIZE:
             return None
         frame = bytes(self._rx_buf[:PacketHandler.PACKET_SIZE])
-        pkt = PacketHandler.decode_packet(frame)
+        pkt = PacketHandler.decode_packet(frame, verify_crc=self._verify_crc)
         if pkt is None:
             # Bad candidate packet header/CRC; shift by one to find next header.
             del self._rx_buf[:1]
@@ -148,6 +149,9 @@ class Radio:
             self.ser.reset_output_buffer()
         except Exception:
             pass
+
+    def set_crc_verification(self, enabled: bool) -> None:
+        self._verify_crc = bool(enabled)
 
     def _mark_disconnected(self, reason: str | None = None) -> None:
         if reason:
@@ -235,6 +239,39 @@ class Radio:
         except (SerialException, OSError) as e:
             self._mark_disconnected(str(e))
 
+    def drop_os_backlog_if_needed(self, threshold_bytes: int = 2048) -> int:
+        """
+        Low-latency helper: if OS RX backlog is large, drop stale bytes so we can
+        jump to near-real-time instead of rendering old data.
+        Returns number of bytes that were pending before flush, or 0.
+        """
+        if self.simulate or not self.ser:
+            return 0
+        try:
+            pending = int(self.ser.in_waiting or 0)
+        except Exception:
+            pending = 0
+        if pending < threshold_bytes:
+            return 0
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        self._rx_buf.clear()
+        return pending
+
+    def prune_rx_buffer_to_latest(self, keep_bytes: int = 256) -> int:
+        """
+        Trim internal parser backlog to recent bytes to avoid decoding stale frames.
+        Returns number of bytes dropped from internal RX buffer.
+        """
+        n = len(self._rx_buf)
+        if n <= keep_bytes:
+            return 0
+        dropped = n - keep_bytes
+        self._rx_buf = self._rx_buf[-keep_bytes:]
+        return dropped
+
     def read_packet(self) -> Optional[DataPacket]:
         if self.simulate:
             return self._read_simulated_packet()
@@ -264,7 +301,7 @@ class Radio:
             return None
 
         frame = bytes(self._rx_buf[:PacketHandler.PACKET_SIZE])
-        pkt = PacketHandler.decode_packet(frame)
+        pkt = PacketHandler.decode_packet(frame, verify_crc=self._verify_crc)
         if pkt is None:
             # Try to resync by dropping one byte from candidate header
             del self._rx_buf[0:1]

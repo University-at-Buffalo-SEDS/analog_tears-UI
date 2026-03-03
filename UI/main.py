@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -118,6 +119,12 @@ class RadioWorker(QtCore.QThread):
         self._csv_file = None
         self._csv_writer: Optional[csv.writer] = None
         self._raw_stream_enabled = False
+        self._ui_emit_in_flight = False
+        self._reader_stop = threading.Event()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._event_queue: deque = deque(maxlen=5000)
+        self._event_lock = threading.Lock()
+        self._low_latency_display_mode = True
 
         # recent telemetry buffer (for “save last 10s”)
         self._recent: Deque[BufferedRow] = deque(maxlen=20000)  # plenty for high-rate
@@ -193,6 +200,37 @@ class RadioWorker(QtCore.QThread):
     @QtCore.pyqtSlot(bool)
     def set_raw_stream_enabled(self, enabled: bool) -> None:
         self._raw_stream_enabled = bool(enabled)
+
+    @QtCore.pyqtSlot()
+    def on_ui_sample_consumed(self) -> None:
+        self._ui_emit_in_flight = False
+
+    def _enqueue_event(self, ev, t_read_mono: float) -> None:
+        with self._event_lock:
+            if len(self._event_queue) >= self._event_queue.maxlen:
+                self._event_queue.popleft()
+            self._event_queue.append((ev, t_read_mono))
+
+    def _dequeue_event(self):
+        with self._event_lock:
+            if not self._event_queue:
+                return None
+            return self._event_queue.popleft()
+
+    def _reader_loop(self) -> None:
+        while not self._reader_stop.is_set():
+            if self._low_latency_display_mode:
+                self.radio.drop_os_backlog_if_needed(256)
+                self.radio.prune_rx_buffer_to_latest(256)
+            try:
+                ev = self.radio.poll_event()
+            except Exception:
+                time.sleep(0.001)
+                continue
+            if ev is None:
+                time.sleep(0.0005)
+                continue
+            self._enqueue_event(ev, time.monotonic())
 
     # ----------------------------
     # CSV helpers (worker thread)
@@ -311,9 +349,14 @@ class RadioWorker(QtCore.QThread):
         last_raw_emit = 0.0
         ui_emit_period = 1.0 / 120.0
         raw_emit_period = 1.0 / 60.0
+        crc_verify_enabled = True
         seen_igniter_command = False
         turn_p_off = False
         p_start = time.monotonic()
+
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, name="radio-reader", daemon=True)
+        self._reader_thread.start()
 
         try:
             while not self._stop:
@@ -328,15 +371,19 @@ class RadioWorker(QtCore.QThread):
                     continue
 
                 # --- unified RX (telemetry + ACKs) ---
-                try:
-                    ev = self.radio.poll_event()
-                except Exception:
-                    # poll_event should already mark disconnected
-                    continue
+                display_only = (not self._logging_enabled) and (self._csv_path is None) and (not self._raw_stream_enabled)
+                self._low_latency_display_mode = display_only
 
-                if ev is None:
+                want_crc = self._logging_enabled or (self._csv_path is not None) or self._raw_stream_enabled
+                if want_crc != crc_verify_enabled:
+                    self.radio.set_crc_verification(want_crc)
+                    crc_verify_enabled = want_crc
+
+                item = self._dequeue_event()
+                if item is None:
                     time.sleep(0.0005)
                     continue
+                ev, ev_t_mono = item
 
                 # --- ACK event ---
                 if isinstance(ev, tuple):
@@ -358,16 +405,15 @@ class RadioWorker(QtCore.QThread):
 
                 # --- telemetry packet ---
                 packet = ev
-                if (not self._logging_enabled) and (self._csv_path is None) and (not self._raw_stream_enabled):
+                packet_t_mono = ev_t_mono
+                if display_only:
                     # Under high-rate streaming, keep only the newest packet for UI.
                     # This prevents unbounded "catch-up" latency growth.
-                    for _ in range(256):
-                        try:
-                            nxt = self.radio.poll_event()
-                        except Exception:
+                    while True:
+                        nxt_item = self._dequeue_event()
+                        if nxt_item is None:
                             break
-                        if nxt is None:
-                            break
+                        nxt, nxt_t_mono = nxt_item
                         if isinstance(nxt, tuple):
                             cmd, state = nxt
                             self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
@@ -379,8 +425,9 @@ class RadioWorker(QtCore.QThread):
                                     p_start = time.monotonic()
                             continue
                         packet = nxt
+                        packet_t_mono = nxt_t_mono
 
-                t_mono = time.monotonic()
+                t_mono = packet_t_mono
                 ch0_raw = float(packet.channel0)
                 ch1_raw = float(packet.channel1)
 
@@ -418,7 +465,7 @@ class RadioWorker(QtCore.QThread):
                         self.raw_sample.emit(float(t_mono), ch0_raw, ch1_raw)
                         last_raw_emit = t_mono
 
-                    if (t_mono - last_ui_emit) >= ui_emit_period:
+                    if (t_mono - last_ui_emit) >= ui_emit_period and (not self._ui_emit_in_flight):
                         if self._calibration is None:
                             ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
                             ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
@@ -461,11 +508,19 @@ class RadioWorker(QtCore.QThread):
                             int(iadc),
                             batt_v,
                         )
+                        self._ui_emit_in_flight = True
                         last_ui_emit = t_mono
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
 
         finally:
+            self._reader_stop.set()
+            if self._reader_thread is not None:
+                try:
+                    self._reader_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._reader_thread = None
             try:
                 self.radio.close()
             except Exception:
@@ -498,6 +553,7 @@ def main():
     win.save_last_10s.connect(worker.save_last_10s, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.raw_stream_enabled.connect(worker.set_raw_stream_enabled, type=QtCore.Qt.ConnectionType.QueuedConnection)
+    win.sample_consumed.connect(worker.on_ui_sample_consumed, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI
     win.set_filename(DEFAULT_CSV_FILENAME)
