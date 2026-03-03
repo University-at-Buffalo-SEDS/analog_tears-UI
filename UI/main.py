@@ -108,7 +108,7 @@ class RadioWorker(QtCore.QThread):
     """
     # t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, tank_pressure, battery_voltage
     sample = QtCore.pyqtSignal(float, float, float, float, float, float, float)
-    raw_sample = QtCore.pyqtSignal(float, float, float)  # t_mono, ch0_raw, ch1_raw
+    raw_sample = QtCore.pyqtSignal(float, float, float, float)  # t_mono, ch0_raw, ch1_raw, iadc_raw
     status = QtCore.pyqtSignal(str)
     data_rate = QtCore.pyqtSignal(float, float)  # bytes_per_s, packets_per_s
 
@@ -598,7 +598,7 @@ class RadioWorker(QtCore.QThread):
                     ch1_raw_ui = float(ui_packet.channel1)
 
                     if self._raw_stream_enabled and (ui_t_mono - last_raw_emit) >= raw_emit_period:
-                        self.raw_sample.emit(float(ui_t_mono), ch0_raw_ui, ch1_raw_ui)
+                        self.raw_sample.emit(float(ui_t_mono), ch0_raw_ui, ch1_raw_ui, float(ui_packet.internal_adc))
                         last_raw_emit = ui_t_mono
 
                     if (ui_t_mono - last_ui_emit) >= ui_emit_period:
@@ -697,9 +697,11 @@ def main():
     app = QtWidgets.QApplication([sys.argv[0], *qt_args])
 
     # Allow Ctrl+C in terminal to close the Qt app cleanly.
-    signal.signal(signal.SIGINT, lambda _sig, _frame: app.quit())
+    # Use a flag + timer hop so Qt shutdown runs on the GUI thread.
+    sigint_requested = threading.Event()
+    signal.signal(signal.SIGINT, lambda _sig, _frame: sigint_requested.set())
     sigint_pump = QtCore.QTimer()
-    sigint_pump.timeout.connect(lambda: None)
+    sigint_pump.timeout.connect(lambda: app.quit() if sigint_requested.is_set() else None)
     sigint_pump.start(100)
 
     worker = RadioWorker(
@@ -739,10 +741,18 @@ def main():
             win.setWindowTitle(f"Serial Telemetry Viewer — {s}")
 
     worker.status.connect(handle_status)
-    app.aboutToQuit.connect(lambda: (worker.stop(), worker.wait(2000)))
-
     worker.start()
-    sys.exit(app.exec())
+
+    exit_code = 0
+    try:
+        exit_code = app.exec()
+    except KeyboardInterrupt:
+        app.quit()
+        exit_code = 130
+    finally:
+        worker.stop()
+        worker.wait(2000)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

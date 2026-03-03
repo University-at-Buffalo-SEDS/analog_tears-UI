@@ -1173,14 +1173,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_labels()
             self._last_stats_refresh_mono = now
 
-    @QtCore.pyqtSlot(float, float, float)
-    def on_raw_sample(self, t_mono: float, ch0_raw: float, ch1_raw: float) -> None:
+    @QtCore.pyqtSlot(float, float, float, float)
+    def on_raw_sample(self, t_mono: float, ch0_raw: float, ch1_raw: float, iadc_raw: float) -> None:
         _ = t_mono  # timestamp retained in signal for future tuning
         self._raw_ch0_recent.append(float(ch0_raw))
         self._raw_ch1_recent.append(float(ch1_raw))
         if self._cal_stream_addr is not None:
             try:
-                payload = f"{float(t_mono):.6f},{float(ch0_raw):.9g},{float(ch1_raw):.9g}".encode("ascii")
+                payload = (
+                    f"{float(t_mono):.6f},{float(ch0_raw):.9g},{float(ch1_raw):.9g},{float(iadc_raw):.9g}"
+                ).encode("ascii")
                 self._cal_stream_sock.sendto(payload, self._cal_stream_addr)
             except Exception:
                 pass
@@ -1239,7 +1241,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 calib_path,
                 "--raw-port",
                 str(raw_port),
-            ])
+            ], start_new_session=True)
             self.raw_stream_enabled.emit(True)
             self._cal_stream_watchdog.start()
             self.calib_status_lbl.setText("Calib: opened external editor")

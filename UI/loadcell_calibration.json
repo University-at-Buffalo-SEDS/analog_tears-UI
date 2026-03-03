@@ -72,6 +72,24 @@
     "type": "linear",
     "x0": 5.714779821573757e-05
   },
+  "points_iadc": [
+    {
+      "expected": 0.0,
+      "iadc_raw": 0.0
+    },
+    {
+      "expected": 100.0,
+      "iadc_raw": 178.0
+    },
+    {
+      "expected": 200.0,
+      "iadc_raw": 356.0
+    }
+  ],
+  "iadc": {
+    "m": 0.5617977528089888,
+    "b": 0.0
+  },
   "ch1_zero_raw": 5.714779821573757e-05,
   "ch0_zero_raw": 0.002122220757883042,
   "ch0_fit": {

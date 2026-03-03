@@ -84,7 +84,7 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
         layout.addLayout(top)
         top.addWidget(QtWidgets.QLabel("Channel:"))
         self.channel_combo = QtWidgets.QComboBox()
-        self.channel_combo.addItems(["Ch0", "Ch1"])
+        self.channel_combo.addItems(["50kg", "1000kg", "Tank Pressure"])
         self.channel_combo.currentIndexChanged.connect(self._reload_list)
         top.addWidget(self.channel_combo)
         self.sequence_lbl = QtWidgets.QLabel("Sequence: —")
@@ -134,9 +134,12 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
     def _channel(self) -> int:
         return int(self.channel_combo.currentIndex())
 
+    def _channel_name(self, ch: int) -> str:
+        return "50kg" if ch == 0 else ("1000kg" if ch == 1 else "Tank Pressure")
+
     def _reload_list(self) -> None:
         ch = self._channel()
-        pts = self._editor._points0_xy if ch == 0 else self._editor._points1_xy
+        pts = self._editor._points_for_channel(ch)
         self.points_list.clear()
         if pts:
             for raw, kg in pts:
@@ -144,7 +147,7 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
         else:
             self.points_list.addItem("(no points)")
         started = self._editor._sequence_started.get(ch, False)
-        self.sequence_lbl.setText(f"Sequence: Ch{ch} {'started' if started else 'not started'}")
+        self.sequence_lbl.setText(f"Sequence: {self._channel_name(ch)} {'started' if started else 'not started'}")
 
     def _on_add(self) -> None:
         dlg = _PointValueDialog(self, title="Add calibration point", weight=0.0, raw=0.0, show_raw=True)
@@ -160,7 +163,7 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
     def _on_edit(self) -> None:
         ch = self._channel()
         row = self.points_list.currentRow()
-        pts = self._editor._points0_xy if ch == 0 else self._editor._points1_xy
+        pts = self._editor._points_for_channel(ch)
         if row < 0 or row >= len(pts):
             self.status_lbl.setText("Status: select a point first")
             return
@@ -189,13 +192,13 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
         if QtWidgets.QMessageBox.question(
             self,
             "Reset channel",
-            f"Reset Ch{ch} points and sequence?",
+            f"Reset {self._channel_name(ch)} points and sequence?",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No,
         ) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         self._editor.reset_channel_points(ch)
-        self.status_lbl.setText(f"Status: Ch{ch} reset")
+        self.status_lbl.setText(f"Status: {self._channel_name(ch)} reset")
         self._reload_list()
 
     def _on_continue_sequence(self) -> None:
@@ -229,6 +232,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._path: Path | None = None
         self._points0_xy: list[tuple[float, float]] = []
         self._points1_xy: list[tuple[float, float]] = []
+        self._points2_xy: list[tuple[float, float]] = []
         self._ch0_fit_meta: dict[str, Any] | None = None
         self._ch1_fit_meta: dict[str, Any] | None = None
         self._raw_port = raw_port
@@ -237,13 +241,14 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._raw_recent: deque[tuple[float, float, float]] = deque(maxlen=512)
         self._live_raw_ch0 = 0.0
         self._live_raw_ch1 = 0.0
+        self._live_raw_iadc = 0.0
         self._capture_active = False
         self._capture_channel = 0
         self._capture_weight = 0.0
         self._capture_target = 200
         self._capture_vals: list[float] = []
         self._capture_mode = "manual"
-        self._sequence_started: dict[int, bool] = {0: False, 1: False}
+        self._sequence_started: dict[int, bool] = {0: False, 1: False, 2: False}
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -266,13 +271,13 @@ class CalibrationEditor(QtWidgets.QWidget):
         grid.addWidget(QtWidgets.QLabel("Slope (m)"), 0, 1)
         grid.addWidget(QtWidgets.QLabel("Intercept (b)"), 0, 2)
 
-        grid.addWidget(QtWidgets.QLabel("Ch0"), 1, 0)
+        grid.addWidget(QtWidgets.QLabel("50kg"), 1, 0)
         self.ch0_m = QtWidgets.QLineEdit()
         self.ch0_b = QtWidgets.QLineEdit()
         grid.addWidget(self.ch0_m, 1, 1)
         grid.addWidget(self.ch0_b, 1, 2)
 
-        grid.addWidget(QtWidgets.QLabel("Ch1"), 2, 0)
+        grid.addWidget(QtWidgets.QLabel("1000kg"), 2, 0)
         self.ch1_m = QtWidgets.QLineEdit()
         self.ch1_b = QtWidgets.QLineEdit()
         grid.addWidget(self.ch1_m, 2, 1)
@@ -286,12 +291,12 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         zero_row = QtWidgets.QHBoxLayout()
         layout.addLayout(zero_row)
-        zero_row.addWidget(QtWidgets.QLabel("Zero raw Ch0:"))
+        zero_row.addWidget(QtWidgets.QLabel("Zero raw 50kg:"))
         self.ch0_zero = QtWidgets.QLineEdit()
         self.ch0_zero.setFixedWidth(160)
         zero_row.addWidget(self.ch0_zero)
         zero_row.addSpacing(20)
-        zero_row.addWidget(QtWidgets.QLabel("Zero raw Ch1:"))
+        zero_row.addWidget(QtWidgets.QLabel("Zero raw 1000kg:"))
         self.ch1_zero = QtWidgets.QLineEdit()
         self.ch1_zero.setFixedWidth(160)
         zero_row.addWidget(self.ch1_zero)
@@ -305,18 +310,22 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         points_row = QtWidgets.QHBoxLayout()
         layout.addLayout(points_row)
-        self.points_ch0_lbl = QtWidgets.QLabel("Ch0 points: —")
-        self.points_ch1_lbl = QtWidgets.QLabel("Ch1 points: —")
+        self.points_ch0_lbl = QtWidgets.QLabel("50kg points: —")
+        self.points_ch1_lbl = QtWidgets.QLabel("1000kg points: —")
+        self.points_iadc_lbl = QtWidgets.QLabel("Tank pressure points: —")
         points_row.addWidget(self.points_ch0_lbl)
         points_row.addWidget(self.points_ch1_lbl)
+        points_row.addWidget(self.points_iadc_lbl)
         points_row.addStretch(1)
 
         fit_row = QtWidgets.QHBoxLayout()
         layout.addLayout(fit_row)
-        self.ch0_fit_lbl = QtWidgets.QLabel("Ch0 fit: —")
+        self.ch0_fit_lbl = QtWidgets.QLabel("50kg fit: —")
         fit_row.addWidget(self.ch0_fit_lbl)
-        self.ch1_fit_lbl = QtWidgets.QLabel("Ch1 fit: —")
+        self.ch1_fit_lbl = QtWidgets.QLabel("1000kg fit: —")
         fit_row.addWidget(self.ch1_fit_lbl)
+        self.iadc_fit_lbl = QtWidgets.QLabel("Tank pressure fit: —")
+        fit_row.addWidget(self.iadc_fit_lbl)
         fit_row.addStretch(1)
 
         ops_row = QtWidgets.QHBoxLayout()
@@ -327,7 +336,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.refit_btn = QtWidgets.QPushButton("Refit from points")
         self.refit_btn.clicked.connect(self._refit_from_points)
         ops_row.addWidget(self.refit_btn)
-        self.seq_state_lbl = QtWidgets.QLabel("Sequence: Ch0 not started, Ch1 not started")
+        self.seq_state_lbl = QtWidgets.QLabel("Sequence: 50kg not started, 1000kg not started, TankP not started")
         ops_row.addWidget(self.seq_state_lbl)
         ops_row.addStretch(1)
 
@@ -336,9 +345,10 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.plot_widget = pg.GraphicsLayoutWidget()
         plots_row.addWidget(self.plot_widget, stretch=1)
 
-        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="Ch0 Calibration")
-        self.p1 = self.plot_widget.addPlot(row=0, col=1, title="Ch1 Calibration")
-        for p in (self.p0, self.p1):
+        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="50kg Calibration")
+        self.p1 = self.plot_widget.addPlot(row=0, col=1, title="1000kg Calibration")
+        self.p2 = self.plot_widget.addPlot(row=0, col=2, title="Tank Pressure Calibration")
+        for p in (self.p0, self.p1, self.p2):
             p.showGrid(x=True, y=True)
             p.setLabel("bottom", "Raw")
             p.setLabel("left", "Expected (kg)")
@@ -346,6 +356,8 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.p0_fit = self.p0.plot([], [], pen=pg.mkPen(width=2))
         self.p1_points = self.p1.plot([], [], pen=None, symbol="o", symbolSize=7)
         self.p1_fit = self.p1.plot([], [], pen=pg.mkPen(width=2))
+        self.p2_points = self.p2.plot([], [], pen=None, symbol="o", symbolSize=7)
+        self.p2_fit = self.p2.plot([], [], pen=pg.mkPen(width=2))
 
         opts_row = QtWidgets.QHBoxLayout()
         layout.addLayout(opts_row)
@@ -429,6 +441,7 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         pts0 = data.get("points", [])
         pts1 = data.get("points_ch1", [])
+        pts2 = data.get("points_iadc", [])
         ch1_fit = data.get("ch1_fit", {})
         ch0_fit = data.get("ch0_fit", {})
         self._ch0_fit_meta = ch0_fit if isinstance(ch0_fit, dict) else None
@@ -437,19 +450,20 @@ class CalibrationEditor(QtWidgets.QWidget):
             a = ch0_fit.get("a")
             b = ch0_fit.get("b")
             c = ch0_fit.get("c")
-            self.ch0_fit_lbl.setText(f"Ch0 fit: poly2 (a={a}, b={b}, c={c})")
+            self.ch0_fit_lbl.setText(f"50kg fit: poly2 (a={a}, b={b}, c={c})")
         else:
-            self.ch0_fit_lbl.setText("Ch0 fit: —")
+            self.ch0_fit_lbl.setText("50kg fit: —")
         if isinstance(ch1_fit, dict) and ch1_fit.get("type") == "poly2":
             a = ch1_fit.get("a")
             b = ch1_fit.get("b")
             c = ch1_fit.get("c")
-            self.ch1_fit_lbl.setText(f"Ch1 fit: poly2 (a={a}, b={b}, c={c})")
+            self.ch1_fit_lbl.setText(f"1000kg fit: poly2 (a={a}, b={b}, c={c})")
         else:
-            self.ch1_fit_lbl.setText("Ch1 fit: —")
+            self.ch1_fit_lbl.setText("1000kg fit: —")
 
         self._points0_xy = []
         self._points1_xy = []
+        self._points2_xy = []
         if isinstance(pts0, list) and pts0:
             for p in pts0:
                 try:
@@ -469,15 +483,27 @@ class CalibrationEditor(QtWidgets.QWidget):
                         self._points1_xy.append((float(raw), float(kg)))
                 except Exception:
                     pass
+        if isinstance(pts2, list) and pts2:
+            for p in pts2:
+                try:
+                    raw = p.get("iadc_raw")
+                    expected = p.get("expected")
+                    if expected is None:
+                        expected = p.get("kg")
+                    if raw is not None and expected is not None:
+                        self._points2_xy.append((float(raw), float(expected)))
+                except Exception:
+                    pass
 
         self._refresh_points_lists()
         self._update_regression_plots()
         self.status_lbl.setText(f"Status: loaded {path}")
 
     def _refresh_points_lists(self) -> None:
-        self.points_ch0_lbl.setText(f"Ch0 points: {len(self._points0_xy)}")
-        self.points_ch1_lbl.setText(f"Ch1 points: {len(self._points1_xy)}")
-        all_w = sorted({kg for _, kg in self._points0_xy} | {kg for _, kg in self._points1_xy})
+        self.points_ch0_lbl.setText(f"50kg points: {len(self._points0_xy)}")
+        self.points_ch1_lbl.setText(f"1000kg points: {len(self._points1_xy)}")
+        self.points_iadc_lbl.setText(f"Tank pressure points: {len(self._points2_xy)}")
+        all_w = sorted({kg for _, kg in self._points0_xy} | {kg for _, kg in self._points1_xy} | {v for _, v in self._points2_xy})
         self.weights_lbl.setText(f"Weights: {all_w}" if all_w else "Weights: —")
         self._update_sequence_status_label()
         self._update_regression_plots()
@@ -485,14 +511,27 @@ class CalibrationEditor(QtWidgets.QWidget):
     def _update_sequence_status_label(self) -> None:
         ch0 = "started" if self._sequence_started.get(0, False) else "not started"
         ch1 = "started" if self._sequence_started.get(1, False) else "not started"
-        self.seq_state_lbl.setText(f"Sequence: Ch0 {ch0}, Ch1 {ch1}")
+        ch2 = "started" if self._sequence_started.get(2, False) else "not started"
+        self.seq_state_lbl.setText(f"Sequence: 50kg {ch0}, 1000kg {ch1}, TankP {ch2}")
 
     def _open_points_modal(self) -> None:
         dlg = _PointsSequenceDialog(self)
         dlg.exec()
 
+    def _points_for_channel(self, channel: int) -> list[tuple[float, float]]:
+        ch = int(channel)
+        if ch == 0:
+            return self._points0_xy
+        if ch == 1:
+            return self._points1_xy
+        return self._points2_xy
+
+    def _channel_name(self, channel: int) -> str:
+        ch = int(channel)
+        return "50kg" if ch == 0 else ("1000kg" if ch == 1 else "Tank Pressure")
+
     def _upsert_point(self, channel: int, kg: float, raw: float) -> str:
-        pts = self._points0_xy if channel == 0 else self._points1_xy
+        pts = self._points_for_channel(channel)
         for i, (_raw_i, kg_i) in enumerate(pts):
             if abs(kg_i - kg) < 1e-9:
                 pts[i] = (raw, kg)
@@ -513,30 +552,30 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._capture_vals.clear()
         self._capture_active = True
         self.status_lbl.setText(
-            f"Status: capturing Ch{self._capture_channel} 0/{self._capture_target} at {self._capture_weight:g} kg..."
+            f"Status: capturing {self._channel_name(self._capture_channel)} 0/{self._capture_target} at {self._capture_weight:g}..."
         )
 
     def add_manual_point(self, channel: int, kg: float, raw: float) -> None:
-        pts = self._points0_xy if int(channel) == 0 else self._points1_xy
+        pts = self._points_for_channel(channel)
         pts.append((float(raw), float(kg)))
-        self.status_lbl.setText(f"Status: added Ch{int(channel)} point ({kg:g} kg, {raw:.6g})")
+        self.status_lbl.setText(f"Status: added {self._channel_name(channel)} point ({kg:g}, {raw:.6g})")
         self._refresh_points_lists()
 
     def update_manual_point(self, channel: int, index: int, kg: float, raw: float) -> bool:
-        pts = self._points0_xy if int(channel) == 0 else self._points1_xy
+        pts = self._points_for_channel(channel)
         if index < 0 or index >= len(pts):
             return False
         pts[index] = (float(raw), float(kg))
-        self.status_lbl.setText(f"Status: updated Ch{int(channel)} point")
+        self.status_lbl.setText(f"Status: updated {self._channel_name(channel)} point")
         self._refresh_points_lists()
         return True
 
     def remove_point(self, channel: int, index: int) -> bool:
-        pts = self._points0_xy if int(channel) == 0 else self._points1_xy
+        pts = self._points_for_channel(channel)
         if index < 0 or index >= len(pts):
             return False
         del pts[index]
-        self.status_lbl.setText(f"Status: removed Ch{int(channel)} point")
+        self.status_lbl.setText(f"Status: removed {self._channel_name(channel)} point")
         self._refresh_points_lists()
         return True
 
@@ -545,11 +584,13 @@ class CalibrationEditor(QtWidgets.QWidget):
         if ch == 0:
             self._points0_xy.clear()
             self.ch0_zero.setText("")
-        else:
+        elif ch == 1:
             self._points1_xy.clear()
             self.ch1_zero.setText("")
+        else:
+            self._points2_xy.clear()
         self._sequence_started[ch] = False
-        self.status_lbl.setText(f"Status: reset Ch{ch} points and sequence")
+        self.status_lbl.setText(f"Status: reset {self._channel_name(ch)} points and sequence")
         self._refresh_points_lists()
 
     def start_sequence_capture(self, channel: int, kg: float, *, start_new: bool) -> bool:
@@ -562,7 +603,7 @@ class CalibrationEditor(QtWidgets.QWidget):
             self._begin_capture(ch, 0.0, "sequence_zero")
             return True
         if not self._sequence_started.get(ch, False):
-            self.status_lbl.setText(f"Status: start Ch{ch} sequence first (0 kg)")
+            self.status_lbl.setText(f"Status: start {self._channel_name(ch)} sequence first (0)")
             return False
         if float(kg) <= 0.0:
             self.status_lbl.setText("Status: expected kg must be > 0 for sequence points")
@@ -582,22 +623,32 @@ class CalibrationEditor(QtWidgets.QWidget):
             except Exception:
                 break
             try:
-                t_s, c0_s, c1_s = payload.decode("ascii", errors="ignore").strip().split(",")
+                parts = payload.decode("ascii", errors="ignore").strip().split(",")
+                if len(parts) < 3:
+                    continue
+                t_s, c0_s, c1_s = parts[0], parts[1], parts[2]
                 t_mono = float(t_s)
                 ch0 = float(c0_s)
                 ch1 = float(c1_s)
+                iadc = float(parts[3]) if len(parts) >= 4 else self._live_raw_iadc
             except Exception:
                 continue
             received = True
             self._raw_recent.append((t_mono, ch0, ch1))
             self._live_raw_ch0 = ch0
             self._live_raw_ch1 = ch1
+            self._live_raw_iadc = iadc
             if self._capture_active:
-                v = ch0 if self._capture_channel == 0 else ch1
+                if self._capture_channel == 0:
+                    v = ch0
+                elif self._capture_channel == 1:
+                    v = ch1
+                else:
+                    v = iadc
                 self._capture_vals.append(v)
                 n = len(self._capture_vals)
                 self.status_lbl.setText(
-                    f"Status: capturing Ch{self._capture_channel} {n}/{self._capture_target} at {self._capture_weight:g} kg..."
+                    f"Status: capturing {self._channel_name(self._capture_channel)} {n}/{self._capture_target} at {self._capture_weight:g}..."
                 )
                 if n >= self._capture_target:
                     avg = sum(self._capture_vals) / float(n)
@@ -605,17 +656,19 @@ class CalibrationEditor(QtWidgets.QWidget):
                     if self._capture_mode == "sequence_zero":
                         if self._capture_channel == 0:
                             self.ch0_zero.setText(str(avg))
-                        else:
+                        elif self._capture_channel == 1:
                             self.ch1_zero.setText(str(avg))
                         self._sequence_started[self._capture_channel] = True
                     self._capture_active = False
                     self._capture_vals.clear()
                     self._refresh_points_lists()
                     self.status_lbl.setText(
-                        f"Status: captured avg raw={avg:.6g} at {self._capture_weight:g} kg on Ch{self._capture_channel} ({action})"
+                        f"Status: captured avg raw={avg:.6g} at {self._capture_weight:g} on {self._channel_name(self._capture_channel)} ({action})"
                     )
         if received and not self._capture_active:
-            self.live_lbl.setText(f"Live raw: Ch0={self._live_raw_ch0:.6g}  Ch1={self._live_raw_ch1:.6g}")
+            self.live_lbl.setText(
+                f"Live raw: 50kg={self._live_raw_ch0:.6g}  1000kg={self._live_raw_ch1:.6g}  TankP={self._live_raw_iadc:.6g}"
+            )
 
     def _refit_from_points(self) -> None:
         def fit_line(xs: list[float], ys: list[float]) -> tuple[float, float]:
@@ -734,14 +787,21 @@ class CalibrationEditor(QtWidgets.QWidget):
                 self.ch0_b.setText(str(b0))
                 self.ch0_zero.setText("" if x0 is None else str(x0))
                 self._ch0_fit_meta = fit0
-                self.ch0_fit_lbl.setText(f"Ch0 fit: {fit0.get('type', 'linear')}")
+                self.ch0_fit_lbl.setText(f"50kg fit: {fit0.get('type', 'linear')}")
             if len(self._points1_xy) >= 3:
                 m1, b1, x1, fit1 = fit_one(self._points1_xy)
                 self.ch1_m.setText(str(m1))
                 self.ch1_b.setText(str(b1))
                 self.ch1_zero.setText("" if x1 is None else str(x1))
                 self._ch1_fit_meta = fit1
-                self.ch1_fit_lbl.setText(f"Ch1 fit: {fit1.get('type', 'linear')}")
+                self.ch1_fit_lbl.setText(f"1000kg fit: {fit1.get('type', 'linear')}")
+            if len(self._points2_xy) >= 2:
+                xs2 = [x for x, _ in self._points2_xy]
+                ys2 = [y for _, y in self._points2_xy]
+                m2, b2 = fit_line(xs2, ys2)
+                self.iadc_m.setText(str(m2))
+                self.iadc_b.setText(str(b2))
+                self.iadc_fit_lbl.setText("Tank pressure fit: linear")
         except Exception as e:
             self.status_lbl.setText(f"Status: refit failed ({e})")
             return
@@ -786,6 +846,7 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         set_channel(self._points0_xy, self.ch0_m, self.ch0_b, self.p0_points, self.p0_fit)
         set_channel(self._points1_xy, self.ch1_m, self.ch1_b, self.p1_points, self.p1_fit)
+        set_channel(self._points2_xy, self.iadc_m, self.iadc_b, self.p2_points, self.p2_fit)
 
     def _save(self) -> None:
         if self._data is None or self._path is None:
@@ -818,7 +879,10 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._data["ch1_zero_raw"] = ch1_zero
         self._data["points"] = [{"kg": kg, "ch0_raw": raw} for raw, kg in self._points0_xy]
         self._data["points_ch1"] = [{"kg": kg, "ch1_raw": raw} for raw, kg in self._points1_xy]
-        self._data["weights_kg"] = sorted({kg for _, kg in self._points0_xy} | {kg for _, kg in self._points1_xy})
+        self._data["points_iadc"] = [{"expected": v, "iadc_raw": raw} for raw, v in self._points2_xy]
+        self._data["weights_kg"] = sorted(
+            {kg for _, kg in self._points0_xy} | {kg for _, kg in self._points1_xy} | {v for _, v in self._points2_xy}
+        )
         if isinstance(self._ch0_fit_meta, dict):
             self._data["ch0_fit"] = self._ch0_fit_meta
         if isinstance(self._ch1_fit_meta, dict):
