@@ -102,18 +102,24 @@ class Radio:
             if len(self._rx_buf) < 4:
                 return None
             frame = bytes(self._rx_buf[:4])
-            del self._rx_buf[:4]
             parsed = PacketHandler.decode_ack(frame)
-            return parsed  # (cmd, state) or None
+            if parsed is not None:
+                del self._rx_buf[:4]
+                return parsed  # (cmd, state)
+            # bad ACK framing/checksum; drop one byte and resync
+            del self._rx_buf[:1]
+            return None
 
         # kind == "pkt"
         if len(self._rx_buf) < PacketHandler.PACKET_SIZE:
             return None
         frame = bytes(self._rx_buf[:PacketHandler.PACKET_SIZE])
-        del self._rx_buf[:PacketHandler.PACKET_SIZE]
         pkt = PacketHandler.decode_packet(frame)
-        if pkt is None and self._rx_buf:
-            del self._rx_buf[:1]  # resync
+        if pkt is None:
+            # Bad candidate packet header/CRC; shift by one to find next header.
+            del self._rx_buf[:1]
+            return None
+        del self._rx_buf[:PacketHandler.PACKET_SIZE]
         return pkt
 
 
@@ -215,15 +221,9 @@ class Radio:
             except Exception:
                 n = 0
 
-            # Non-blocking-ish: read what's waiting; otherwise read 1 with timeout
-            chunk = self.ser.read(n) if n > 0 else self.ser.read(1)
-
-            # If OS said bytes were ready but read returned empty, treat as disconnect
-            if n > 0 and chunk == b"":
-                raise SerialException(
-                    "device reports readiness to read but returned no data "
-                    "(device disconnected or multiple access on port?)"
-                )
+            if n <= 0:
+                return
+            chunk = self.ser.read(n)
 
             if chunk:
                 self._rx_buf += chunk
@@ -264,15 +264,13 @@ class Radio:
             return None
 
         frame = bytes(self._rx_buf[:PacketHandler.PACKET_SIZE])
-        del self._rx_buf[:PacketHandler.PACKET_SIZE]
-
         pkt = PacketHandler.decode_packet(frame)
         if pkt is None:
-            # Try to resync by dropping one byte
-            if self._rx_buf:
-                del self._rx_buf[0:1]
+            # Try to resync by dropping one byte from candidate header
+            del self._rx_buf[0:1]
             return None
 
+        del self._rx_buf[:PacketHandler.PACKET_SIZE]
         return pkt
 
     # -------------------------

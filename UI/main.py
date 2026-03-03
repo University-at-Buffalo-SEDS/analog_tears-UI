@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -96,17 +97,18 @@ class RadioWorker(QtCore.QThread):
     Background serial read loop.
     Emits values to GUI and (optionally) logs to CSV.
     """
-    # t_seconds, ch0(float), ch1(float), internal_adc(int), battery_voltage(float)
+    # t_mono, ch0(float), ch1(float), internal_adc(int), battery_voltage(float)
     sample = QtCore.pyqtSignal(float, float, float, int, float)
-    raw_sample = QtCore.pyqtSignal(float, float)  # ch0_raw, ch1_raw
+    raw_sample = QtCore.pyqtSignal(float, float, float)  # t_mono, ch0_raw, ch1_raw
     status = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, com_port: str, calibration_path: Path, parent=None):
+    def __init__(self, *, com_port: str, calibration_path: Path, baudrate: int = 57600, parent=None):
         super().__init__(parent)
         self._com_port = com_port
+        self._baudrate = int(baudrate)
         self._stop = False
 
-        self.radio = Radio(port=self._com_port)
+        self.radio = Radio(port=self._com_port, baudrate=self._baudrate)
         self._calibration_path = calibration_path
         self._calibration: Optional[Calibration] = load_calibration(self._calibration_path)
 
@@ -300,11 +302,10 @@ class RadioWorker(QtCore.QThread):
     # ----------------------------
     def run(self) -> None:
         last_status = ""
-        t0 = time.monotonic()
         last_ui_emit = 0.0
         last_raw_emit = 0.0
         ui_emit_period = 1.0 / 60.0
-        raw_emit_period = 1.0 / 120.0
+        raw_emit_period = 1.0 / 90.0
         seen_igniter_command = False
         turn_p_off = False
         p_start = time.monotonic()
@@ -329,6 +330,7 @@ class RadioWorker(QtCore.QThread):
                     continue
 
                 if ev is None:
+                    time.sleep(0.0005)
                     continue
 
                 # --- ACK event ---
@@ -351,82 +353,82 @@ class RadioWorker(QtCore.QThread):
 
                 # --- telemetry packet ---
                 packet = ev
-                rx_timestamp = datetime.now().isoformat(timespec="milliseconds")
                 t_mono = time.monotonic()
+                ch0_raw = float(packet.channel0)
+                ch1_raw = float(packet.channel1)
 
-                # Build CSV row + dedupe key
-                try:
-                    # expects packet.to_csv_row(rx_timestamp) returns:
-                    # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, battery_voltage, crc]
-                    row = packet.to_csv_row(rx_timestamp)
-                    key = CsvKey(
-                        header=int(row[1]),
-                        seq=int(row[2]),
-                        timestamp=int(row[3]),
-                        crc=int(row[8]),
-                    )
-                except Exception as e:
-                    self.status.emit(f"Packet->CSV error: {e}")
-                    continue
-
-                # Buffer for snapshots
-                self._recent.append(BufferedRow(t_mono=t_mono, key=key, row=row))
-
-                # CSV output (if enabled)
-                if self._logging_enabled:
+                # CSV work is expensive; skip it unless a save session has been started.
+                if self._logging_enabled or self._csv_path is not None:
+                    rx_timestamp = datetime.now().isoformat(timespec="milliseconds")
                     try:
-                        self._open_csv_if_needed()
-                        self._write_row_dedup(key, row)
+                        # expects packet.to_csv_row(rx_timestamp) returns:
+                        # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, battery_voltage, crc]
+                        row = packet.to_csv_row(rx_timestamp)
+                        key = CsvKey(
+                            header=int(row[1]),
+                            seq=int(row[2]),
+                            timestamp=int(row[3]),
+                            crc=int(row[8]),
+                        )
                     except Exception as e:
-                        self.status.emit(f"CSV write error: {e}")
+                        self.status.emit(f"Packet->CSV error: {e}")
+                        continue
+
+                    # Buffer for snapshots
+                    self._recent.append(BufferedRow(t_mono=t_mono, key=key, row=row))
+
+                    # CSV output (if enabled)
+                    if self._logging_enabled:
+                        try:
+                            self._open_csv_if_needed()
+                            self._write_row_dedup(key, row)
+                        except Exception as e:
+                            self.status.emit(f"CSV write error: {e}")
 
                 # GUI update
                 try:
-                    t = time.monotonic() - t0
-                    ch0_raw = float(packet.channel0)
-                    ch1_raw = float(packet.channel1)
-                    if self._calibration is None:
-                        ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
-                        ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
-                    else:
-                        if self._calibration.ch0_poly2 is not None:
-                            a, b, c = self._calibration.ch0_poly2
-                            if self._calibration.ch0_zero_raw is not None:
-                                x = ch0_raw - self._calibration.ch0_zero_raw
-                                ch0_kg = (a * x * x) + (b * x) + c
-                            else:
-                                ch0_kg = (a * ch0_raw * ch0_raw) + (b * ch0_raw) + c
-                        elif self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
-                            if self._calibration.ch0_zero_raw is not None:
-                                ch0_kg = self._calibration.ch0_m * (ch0_raw - self._calibration.ch0_zero_raw)
-                            else:
-                                ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
-                        else:
-                            ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
-
-                        if self._calibration.ch1_poly2 is not None:
-                            a, b, c = self._calibration.ch1_poly2
-                            if self._calibration.ch1_zero_raw is not None:
-                                x = ch1_raw - self._calibration.ch1_zero_raw
-                                ch1_kg = (a * x * x) + (b * x) + c
-                            else:
-                                ch1_kg = (a * ch1_raw * ch1_raw) + (b * ch1_raw) + c
-                        elif self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
-                            if self._calibration.ch1_zero_raw is not None:
-                                ch1_kg = self._calibration.ch1_m * (ch1_raw - self._calibration.ch1_zero_raw)
-                            else:
-                                ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
-                        else:
-                            ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
-                    iadc = (packet.internal_adc / 1.78)
-                    batt_v = float(packet.battery_voltage)
                     if (t_mono - last_raw_emit) >= raw_emit_period:
-                        self.raw_sample.emit(ch0_raw, ch1_raw)
+                        self.raw_sample.emit(float(t_mono), ch0_raw, ch1_raw)
                         last_raw_emit = t_mono
 
                     if (t_mono - last_ui_emit) >= ui_emit_period:
+                        if self._calibration is None:
+                            ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
+                            ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
+                        else:
+                            if self._calibration.ch0_poly2 is not None:
+                                a, b, c = self._calibration.ch0_poly2
+                                if self._calibration.ch0_zero_raw is not None:
+                                    x = ch0_raw - self._calibration.ch0_zero_raw
+                                    ch0_kg = (a * x * x) + (b * x) + c
+                                else:
+                                    ch0_kg = (a * ch0_raw * ch0_raw) + (b * ch0_raw) + c
+                            elif self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
+                                if self._calibration.ch0_zero_raw is not None:
+                                    ch0_kg = self._calibration.ch0_m * (ch0_raw - self._calibration.ch0_zero_raw)
+                                else:
+                                    ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
+                            else:
+                                ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
+
+                            if self._calibration.ch1_poly2 is not None:
+                                a, b, c = self._calibration.ch1_poly2
+                                if self._calibration.ch1_zero_raw is not None:
+                                    x = ch1_raw - self._calibration.ch1_zero_raw
+                                    ch1_kg = (a * x * x) + (b * x) + c
+                                else:
+                                    ch1_kg = (a * ch1_raw * ch1_raw) + (b * ch1_raw) + c
+                            elif self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
+                                if self._calibration.ch1_zero_raw is not None:
+                                    ch1_kg = self._calibration.ch1_m * (ch1_raw - self._calibration.ch1_zero_raw)
+                                else:
+                                    ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
+                            else:
+                                ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
+                        iadc = (packet.internal_adc / 1.78)
+                        batt_v = float(packet.battery_voltage)
                         self.sample.emit(
-                            float(t),
+                            float(t_mono),
                             float(ch0_kg),
                             float(ch1_kg),
                             int(iadc),
@@ -447,12 +449,13 @@ class RadioWorker(QtCore.QThread):
 
 def main():
     COM_PORT = "/dev/tty.usbserial-BG00HPF3"
+    BAUDRATE = int(os.environ.get("ANALOG_TEARS_BAUD", "57600"))
     DEFAULT_CSV_FILENAME = str(Path(__file__).parent / "Data" / "HTF_Data.csv")
     CALIBRATION_PATH = Path(__file__).with_name("loadcell_calibration.json")
 
     app = QtWidgets.QApplication(sys.argv)
 
-    worker = RadioWorker(com_port=COM_PORT, calibration_path=CALIBRATION_PATH)
+    worker = RadioWorker(com_port=COM_PORT, calibration_path=CALIBRATION_PATH, baudrate=BAUDRATE)
 
     win = MainWindow(history=2000, send_command=worker.send_command)
     win.resize(1100, 860)

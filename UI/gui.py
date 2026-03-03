@@ -290,6 +290,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send_command = send_command
         self._plot_refresh_interval_s = 1.0 / 30.0
         self._last_plot_refresh_mono = 0.0
+        self._max_sample_lag_s = 0.200
+        self._max_raw_lag_s = 0.300
+        self._stream_t0_mono: Optional[float] = None
 
         # Filter settings
         self._filter_enabled = True
@@ -550,6 +553,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.c1 = self.p1.plot([], [])
         self.c2 = self.p2.plot([], [])
         self.c3 = self.p3.plot([], [])
+        for c in (self.c0, self.c1, self.c2, self.c3):
+            c.setDownsampling(auto=True, method="peak")
+            c.setClipToView(True)
 
         self._recompute_window_maxes()
         self._update_labels()
@@ -761,6 +767,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
         self._reset_filter_state()
+        self._stream_t0_mono = None
         self._last_plot_refresh_mono = 0.0
         self._update_labels()
         self._redraw()
@@ -868,7 +875,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(float, float, float, int, float)
     def on_sample(
         self,
-        t_seconds: float,
+        t_mono: float,
         ch0: float,
         ch1: float,
         internal_adc: int,
@@ -876,8 +883,14 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         if self._paused:
             return
+        now_mono = time.monotonic()
+        if (now_mono - float(t_mono)) > self._max_sample_lag_s:
+            return
+        if self._stream_t0_mono is None:
+            self._stream_t0_mono = float(t_mono)
+        t_seconds = float(t_mono) - self._stream_t0_mono
 
-        self._xs.append(float(t_seconds))
+        self._xs.append(t_seconds)
         self._raw_ch0.append(float(ch0))
         self._raw_ch1.append(float(ch1))
         self._raw_iadc.append(int(internal_adc))
@@ -907,8 +920,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._redraw()
             self._last_plot_refresh_mono = now
 
-    @QtCore.pyqtSlot(float, float)
-    def on_raw_sample(self, ch0_raw: float, ch1_raw: float) -> None:
+    @QtCore.pyqtSlot(float, float, float)
+    def on_raw_sample(self, t_mono: float, ch0_raw: float, ch1_raw: float) -> None:
+        if (time.monotonic() - float(t_mono)) > self._max_raw_lag_s:
+            return
         self._raw_ch0_recent.append(float(ch0_raw))
         self._raw_ch1_recent.append(float(ch1_raw))
 

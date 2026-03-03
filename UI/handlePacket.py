@@ -104,8 +104,7 @@ class PacketHandler:
                 battery_voltage=battery_voltage,
                 crc=crc,
             )
-        except Exception as e:
-            print(f"Packet decode error: {e}")
+        except Exception:
             return None
 
     # ---- command/ack helpers unchanged ----
