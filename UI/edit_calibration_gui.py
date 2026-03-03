@@ -66,6 +66,19 @@ class CalibrationEditor(QtWidgets.QWidget):
         grid.addWidget(self.ch1_m, 2, 1)
         grid.addWidget(self.ch1_b, 2, 2)
 
+        zero_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(zero_row)
+        zero_row.addWidget(QtWidgets.QLabel("Zero raw Ch0:"))
+        self.ch0_zero = QtWidgets.QLineEdit()
+        self.ch0_zero.setFixedWidth(160)
+        zero_row.addWidget(self.ch0_zero)
+        zero_row.addSpacing(20)
+        zero_row.addWidget(QtWidgets.QLabel("Zero raw Ch1:"))
+        self.ch1_zero = QtWidgets.QLineEdit()
+        self.ch1_zero.setFixedWidth(160)
+        zero_row.addWidget(self.ch1_zero)
+        zero_row.addStretch(1)
+
         info_row = QtWidgets.QHBoxLayout()
         layout.addLayout(info_row)
         self.weights_lbl = QtWidgets.QLabel("Weights: —")
@@ -147,6 +160,9 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.ch1_m.setText("" if "m" not in ch1 or ch1["m"] is None else str(ch1["m"]))
         self.ch1_b.setText("" if "b" not in ch1 or ch1["b"] is None else str(ch1["b"]))
 
+        self.ch0_zero.setText("" if data.get("ch0_zero_raw") is None else str(data.get("ch0_zero_raw")))
+        self.ch1_zero.setText("" if data.get("ch1_zero_raw") is None else str(data.get("ch1_zero_raw")))
+
         weights = data.get("weights_kg", [])
         if isinstance(weights, list) and weights:
             self.weights_lbl.setText(f"Weights: {weights}")
@@ -207,6 +223,8 @@ class CalibrationEditor(QtWidgets.QWidget):
             ch0_b = _get_float(self.ch0_b.text())
             ch1_m = _get_float(self.ch1_m.text())
             ch1_b = _get_float(self.ch1_b.text())
+            ch0_zero = _get_float(self.ch0_zero.text())
+            ch1_zero = _get_float(self.ch1_zero.text())
         except Exception as e:
             self.status_lbl.setText(f"Status: invalid number ({e})")
             return
@@ -217,6 +235,8 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._data["ch0"]["b"] = ch0_b
         self._data["ch1"]["m"] = ch1_m
         self._data["ch1"]["b"] = ch1_b
+        self._data["ch0_zero_raw"] = ch0_zero
+        self._data["ch1_zero_raw"] = ch1_zero
 
         try:
             if self.backup_chk.isChecked():

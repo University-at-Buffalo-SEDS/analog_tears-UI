@@ -29,7 +29,7 @@ class Radio:
         *,
         sim_rate_hz: float = 50.0,
         sim_seed: Optional[int] = None,
-        serial_timeout: float = 0.05,
+        serial_timeout: float = 0.00005,  # non-blocking by default to reduce latency
     ):
         self.port = port
         self.baudrate = baudrate
