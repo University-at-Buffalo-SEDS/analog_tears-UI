@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+import argparse
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,6 +19,7 @@ from PyQt6 import QtCore, QtWidgets
 
 from gui import MainWindow
 from radio import Radio
+from handlePacket import PacketHandler
 
 frontend_disable_pilot = False
 
@@ -103,13 +105,24 @@ class RadioWorker(QtCore.QThread):
     raw_sample = QtCore.pyqtSignal(float, float, float)  # t_mono, ch0_raw, ch1_raw
     status = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, com_port: str, calibration_path: Path, baudrate: int = 57600, parent=None):
+    def __init__(
+        self,
+        *,
+        com_port: str,
+        calibration_path: Path,
+        baudrate: int = 57600,
+        sim_rate_hz: float | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._com_port = com_port
         self._baudrate = int(baudrate)
         self._stop = False
 
-        self.radio = Radio(port=self._com_port, baudrate=self._baudrate)
+        radio_kwargs = {}
+        if sim_rate_hz is not None:
+            radio_kwargs["sim_rate_hz"] = float(sim_rate_hz)
+        self.radio = Radio(port=self._com_port, baudrate=self._baudrate, **radio_kwargs)
         self._calibration_path = calibration_path
         self._calibration: Optional[Calibration] = load_calibration(self._calibration_path)
 
@@ -126,6 +139,7 @@ class RadioWorker(QtCore.QThread):
         self._event_queue: deque = deque(maxlen=5000)
         self._event_lock = threading.Lock()
         self._low_latency_display_mode = True
+        self._latest_display_packet: Optional[tuple[object, float]] = None
 
         # recent telemetry buffer (for “save last 10s”)
         self._recent: Deque[BufferedRow] = deque(maxlen=20000)  # plenty for high-rate
@@ -233,6 +247,16 @@ class RadioWorker(QtCore.QThread):
                 return None
             return self._event_queue.popleft()
 
+    def _set_latest_display_packet(self, ev, t_read_mono: float) -> None:
+        with self._event_lock:
+            self._latest_display_packet = (ev, t_read_mono)
+
+    def _take_latest_display_packet(self):
+        with self._event_lock:
+            item = self._latest_display_packet
+            self._latest_display_packet = None
+            return item
+
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
             if self._low_latency_display_mode:
@@ -245,9 +269,15 @@ class RadioWorker(QtCore.QThread):
                 time.sleep(0.001)
                 continue
             if ev is None:
-                time.sleep(0.0005)
+                # Yield CPU to keep UI responsive during high-rate test/sim loops.
+                time.sleep(0.0001 if self.radio.simulate else 0.0005)
                 continue
-            self._enqueue_event(ev, time.monotonic())
+            t_now = time.monotonic()
+            if self._low_latency_display_mode and (not isinstance(ev, tuple)):
+                # In display-only mode keep only newest telemetry packet.
+                self._set_latest_display_packet(ev, t_now)
+                continue
+            self._enqueue_event(ev, t_now)
 
     # ----------------------------
     # CSV helpers (worker thread)
@@ -397,6 +427,8 @@ class RadioWorker(QtCore.QThread):
                     crc_verify_enabled = want_crc
 
                 item = self._dequeue_event()
+                if item is None and display_only:
+                    item = self._take_latest_display_packet()
                 if item is None:
                     time.sleep(0.0005)
                     continue
@@ -546,14 +578,62 @@ class RadioWorker(QtCore.QThread):
 
 
 def main():
-    COM_PORT = "/dev/tty.usbserial-BG00HPF3"
-    BAUDRATE = int(os.environ.get("ANALOG_TEARS_BAUD", "57600"))
-    DEFAULT_CSV_FILENAME = str(Path(__file__).parent / "Data" / "HTF_Data.csv")
-    CALIBRATION_PATH = Path(__file__).with_name("loadcell_calibration.json")
+    default_com_port = os.environ.get("ANALOG_TEARS_PORT", "/dev/tty.usbserial-BG00HPF3")
+    default_baudrate = int(os.environ.get("ANALOG_TEARS_BAUD", "57600"))
+    default_csv_filename = str(Path(__file__).parent / "Data" / "HTF_Data.csv")
+    default_calibration_path = str(Path(__file__).with_name("loadcell_calibration.json"))
 
-    app = QtWidgets.QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="Analog Tears UI")
+    parser.add_argument("--port", "--com-port", dest="port", default=default_com_port, help="Serial COM port/device")
+    parser.add_argument("port_positional", nargs="?", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--baud", type=int, default=default_baudrate, help="Serial baud rate")
+    parser.add_argument("--csv", default=default_csv_filename, help="Default CSV output filename")
+    parser.add_argument(
+        "--calibration",
+        default=default_calibration_path,
+        help="Path to load cell calibration JSON",
+    )
+    parser.add_argument(
+        "--sim-bytes-per-sec",
+        type=float,
+        default=0.0,
+        help="Dummy mode target throughput in bytes/s (e.g. 120000 for 120 kB/s)",
+    )
+    parser.add_argument(
+        "--sim-rate-hz",
+        type=float,
+        default=0.0,
+        help="Dummy mode packet rate in packets/s (overrides --sim-bytes-per-sec)",
+    )
+    # Keep unknown CLI args available for Qt instead of failing argparse.
+    args, qt_args = parser.parse_known_args()
 
-    worker = RadioWorker(com_port=COM_PORT, calibration_path=CALIBRATION_PATH, baudrate=BAUDRATE)
+    com_port = str(args.port_positional or args.port).strip()
+    if com_port.lower() in {"test", "testing"}:
+        com_port = "dummy"
+    baudrate = int(args.baud)
+    default_csv_filename = str(args.csv)
+    calibration_path = Path(str(args.calibration))
+    sim_rate_hz: float | None = None
+    if com_port.lower() in {"dummy", "sim", "simulation"}:
+        if float(args.sim_rate_hz) > 0.0:
+            sim_rate_hz = float(args.sim_rate_hz)
+        elif float(args.sim_bytes_per_sec) > 0.0:
+            sim_rate_hz = float(args.sim_bytes_per_sec) / float(PacketHandler.PACKET_SIZE)
+        if sim_rate_hz is not None:
+            print(
+                f"[Test] Dummy source configured for ~{sim_rate_hz:.1f} pkt/s "
+                f"(~{sim_rate_hz * PacketHandler.PACKET_SIZE:.0f} B/s)"
+            )
+
+    app = QtWidgets.QApplication([sys.argv[0], *qt_args])
+
+    worker = RadioWorker(
+        com_port=com_port,
+        calibration_path=calibration_path,
+        baudrate=baudrate,
+        sim_rate_hz=sim_rate_hz,
+    )
 
     # Keep enough samples for long time windows at high refresh rates.
     win = MainWindow(history=120000, send_command=worker.send_command)
@@ -574,8 +654,8 @@ def main():
     win.sample_consumed.connect(worker.on_ui_sample_consumed, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI
-    win.set_filename(DEFAULT_CSV_FILENAME)
-    win.set_calibration_filename(str(CALIBRATION_PATH))
+    win.set_filename(default_csv_filename)
+    win.set_calibration_filename(str(calibration_path))
 
     def handle_status(s: str) -> None:
         if s.startswith("ACK:"):

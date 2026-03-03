@@ -1027,7 +1027,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         if len(self._calib_pending_samples) >= self._calib_samples_per_point:
-            channel = self._calib_pending_channel
+            # channel = self._calib_pending_channel
             avg = sum(self._calib_pending_samples) / len(self._calib_pending_samples)
 
             cb = self._calib_pending_callback
