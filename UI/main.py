@@ -301,6 +301,10 @@ class RadioWorker(QtCore.QThread):
     def run(self) -> None:
         last_status = ""
         t0 = time.monotonic()
+        last_ui_emit = 0.0
+        last_raw_emit = 0.0
+        ui_emit_period = 1.0 / 60.0
+        raw_emit_period = 1.0 / 120.0
         seen_igniter_command = False
         turn_p_off = False
         p_start = time.monotonic()
@@ -416,14 +420,19 @@ class RadioWorker(QtCore.QThread):
                             ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
                     iadc = (packet.internal_adc / 1.78)
                     batt_v = float(packet.battery_voltage)
-                    self.raw_sample.emit(ch0_raw, ch1_raw)
-                    self.sample.emit(
-                        float(t),
-                        float(ch0_kg),
-                        float(ch1_kg),
-                        int(iadc),
-                        batt_v,
-                    )
+                    if (t_mono - last_raw_emit) >= raw_emit_period:
+                        self.raw_sample.emit(ch0_raw, ch1_raw)
+                        last_raw_emit = t_mono
+
+                    if (t_mono - last_ui_emit) >= ui_emit_period:
+                        self.sample.emit(
+                            float(t),
+                            float(ch0_kg),
+                            float(ch1_kg),
+                            int(iadc),
+                            batt_v,
+                        )
+                        last_ui_emit = t_mono
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
 

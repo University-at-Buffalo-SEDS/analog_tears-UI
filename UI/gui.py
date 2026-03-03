@@ -5,6 +5,7 @@ import json
 import hashlib
 import hmac
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -287,6 +288,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._history = int(history)
         self._window_seconds = float(initial_window_seconds)
         self._send_command = send_command
+        self._plot_refresh_interval_s = 1.0 / 30.0
+        self._last_plot_refresh_mono = 0.0
 
         # Filter settings
         self._filter_enabled = True
@@ -758,6 +761,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
         self._reset_filter_state()
+        self._last_plot_refresh_mono = 0.0
         self._update_labels()
         self._redraw()
 
@@ -896,9 +900,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flt_iadc.append(int(round(self._ema_iadc)))
         self._flt_batt.append(float(self._ema_batt))
 
-        self._recompute_window_maxes()
-        self._update_labels()
-        self._redraw()
+        now = time.monotonic()
+        if (now - self._last_plot_refresh_mono) >= self._plot_refresh_interval_s:
+            self._recompute_window_maxes()
+            self._update_labels()
+            self._redraw()
+            self._last_plot_refresh_mono = now
 
     @QtCore.pyqtSlot(float, float)
     def on_raw_sample(self, ch0_raw: float, ch1_raw: float) -> None:
