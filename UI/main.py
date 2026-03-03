@@ -104,6 +104,7 @@ class RadioWorker(QtCore.QThread):
     sample = QtCore.pyqtSignal(float, float, float, int, float)
     raw_sample = QtCore.pyqtSignal(float, float, float)  # t_mono, ch0_raw, ch1_raw
     status = QtCore.pyqtSignal(str)
+    data_rate = QtCore.pyqtSignal(float, float)  # bytes_per_s, packets_per_s
 
     def __init__(
         self,
@@ -133,6 +134,7 @@ class RadioWorker(QtCore.QThread):
         self._csv_file = None
         self._csv_writer: Optional[csv.writer] = None
         self._raw_stream_enabled = False
+        self._display_raw_values = False
         self._ui_emit_in_flight = False
         self._reader_stop = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
@@ -140,6 +142,9 @@ class RadioWorker(QtCore.QThread):
         self._event_lock = threading.Lock()
         self._low_latency_display_mode = True
         self._latest_display_packet: Optional[tuple[object, float]] = None
+        self._rate_lock = threading.Lock()
+        self._ingress_packets = 0
+        self._ingress_bytes = 0
 
         # recent telemetry buffer (for “save last 10s”)
         self._recent: Deque[BufferedRow] = deque(maxlen=20000)  # plenty for high-rate
@@ -231,6 +236,10 @@ class RadioWorker(QtCore.QThread):
     def set_raw_stream_enabled(self, enabled: bool) -> None:
         self._raw_stream_enabled = bool(enabled)
 
+    @QtCore.pyqtSlot(bool)
+    def set_display_raw_values(self, enabled: bool) -> None:
+        self._display_raw_values = bool(enabled)
+
     @QtCore.pyqtSlot()
     def on_ui_sample_consumed(self) -> None:
         self._ui_emit_in_flight = False
@@ -257,6 +266,15 @@ class RadioWorker(QtCore.QThread):
             self._latest_display_packet = None
             return item
 
+    def _add_ingress_telemetry(self, packet_count: int, byte_count: int) -> None:
+        with self._rate_lock:
+            self._ingress_packets += int(packet_count)
+            self._ingress_bytes += int(byte_count)
+
+    def _take_ingress_totals(self) -> tuple[int, int]:
+        with self._rate_lock:
+            return self._ingress_packets, self._ingress_bytes
+
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
             if self._low_latency_display_mode:
@@ -273,10 +291,12 @@ class RadioWorker(QtCore.QThread):
                 time.sleep(0.0001 if self.radio.simulate else 0.0005)
                 continue
             t_now = time.monotonic()
-            if self._low_latency_display_mode and (not isinstance(ev, tuple)):
-                # In display-only mode keep only newest telemetry packet.
+            if not isinstance(ev, tuple):
+                self._add_ingress_telemetry(1, PacketHandler.PACKET_SIZE)
+                # Always keep newest telemetry packet available for low-latency UI display.
                 self._set_latest_display_packet(ev, t_now)
-                continue
+                if self._low_latency_display_mode:
+                    continue
             self._enqueue_event(ev, t_now)
 
     # ----------------------------
@@ -305,6 +325,8 @@ class RadioWorker(QtCore.QThread):
                 "Internal ADC",
                 "Battery Voltage",
                 "CRC",
+                "Ch0_kg",
+                "Ch1_kg",
             ])
             self._write_calibration_row()
             self._csv_file.flush()
@@ -380,12 +402,52 @@ class RadioWorker(QtCore.QThread):
             "",
             "",
             "",
+            "",
+            "",
         ]
         self._csv_writer.writerow(row)
         try:
             self._csv_file.flush()
         except Exception:
             pass
+
+    def _calibrate_channels(self, ch0_raw: float, ch1_raw: float) -> tuple[float, float]:
+        if self._calibration is None:
+            ch0_kg = (5.0 / 12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0 / 6.0)
+            ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
+            return float(ch0_kg), float(ch1_kg)
+
+        if self._calibration.ch0_poly2 is not None:
+            a, b, c = self._calibration.ch0_poly2
+            if self._calibration.ch0_zero_raw is not None:
+                x = ch0_raw - self._calibration.ch0_zero_raw
+                ch0_kg = (a * x * x) + (b * x) + c
+            else:
+                ch0_kg = (a * ch0_raw * ch0_raw) + (b * ch0_raw) + c
+        elif self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
+            if self._calibration.ch0_zero_raw is not None:
+                ch0_kg = self._calibration.ch0_m * (ch0_raw - self._calibration.ch0_zero_raw)
+            else:
+                ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
+        else:
+            ch0_kg = (5.0 / 12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0 / 6.0)
+
+        if self._calibration.ch1_poly2 is not None:
+            a, b, c = self._calibration.ch1_poly2
+            if self._calibration.ch1_zero_raw is not None:
+                x = ch1_raw - self._calibration.ch1_zero_raw
+                ch1_kg = (a * x * x) + (b * x) + c
+            else:
+                ch1_kg = (a * ch1_raw * ch1_raw) + (b * ch1_raw) + c
+        elif self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
+            if self._calibration.ch1_zero_raw is not None:
+                ch1_kg = self._calibration.ch1_m * (ch1_raw - self._calibration.ch1_zero_raw)
+            else:
+                ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
+        else:
+            ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
+
+        return float(ch0_kg), float(ch1_kg)
 
     # ----------------------------
     # Main worker loop
@@ -396,6 +458,10 @@ class RadioWorker(QtCore.QThread):
         last_raw_emit = 0.0
         ui_emit_period = 1.0 / 120.0
         raw_emit_period = 1.0 / 60.0
+        rate_period = 0.25
+        last_rate_emit = time.monotonic()
+        prev_ingress_packets = 0
+        prev_ingress_bytes = 0
         crc_verify_enabled = True
         seen_igniter_command = False
         turn_p_off = False
@@ -487,6 +553,8 @@ class RadioWorker(QtCore.QThread):
                         # expects packet.to_csv_row(rx_timestamp) returns:
                         # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, battery_voltage, crc]
                         row = packet.to_csv_row(rx_timestamp)
+                        ch0_kg_csv, ch1_kg_csv = self._calibrate_channels(ch0_raw, ch1_raw)
+                        row.extend([ch0_kg_csv, ch1_kg_csv])
                         key = CsvKey(
                             header=int(row[1]),
                             seq=int(row[2]),
@@ -510,56 +578,48 @@ class RadioWorker(QtCore.QThread):
 
                 # GUI update
                 try:
-                    if self._raw_stream_enabled and (t_mono - last_raw_emit) >= raw_emit_period:
-                        self.raw_sample.emit(float(t_mono), ch0_raw, ch1_raw)
-                        last_raw_emit = t_mono
+                    ui_packet = packet
+                    ui_t_mono = t_mono
+                    latest_ui = self._take_latest_display_packet()
+                    if latest_ui is not None and (not isinstance(latest_ui[0], tuple)):
+                        ui_packet, ui_t_mono = latest_ui
 
-                    if (t_mono - last_ui_emit) >= ui_emit_period:
-                        if self._calibration is None:
-                            ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
-                            ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
+                    ch0_raw_ui = float(ui_packet.channel0)
+                    ch1_raw_ui = float(ui_packet.channel1)
+
+                    if self._raw_stream_enabled and (ui_t_mono - last_raw_emit) >= raw_emit_period:
+                        self.raw_sample.emit(float(ui_t_mono), ch0_raw_ui, ch1_raw_ui)
+                        last_raw_emit = ui_t_mono
+
+                    if (ui_t_mono - last_ui_emit) >= ui_emit_period:
+                        if self._display_raw_values:
+                            ch0_out = float(ch0_raw_ui)
+                            ch1_out = float(ch1_raw_ui)
                         else:
-                            if self._calibration.ch0_poly2 is not None:
-                                a, b, c = self._calibration.ch0_poly2
-                                if self._calibration.ch0_zero_raw is not None:
-                                    x = ch0_raw - self._calibration.ch0_zero_raw
-                                    ch0_kg = (a * x * x) + (b * x) + c
-                                else:
-                                    ch0_kg = (a * ch0_raw * ch0_raw) + (b * ch0_raw) + c
-                            elif self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
-                                if self._calibration.ch0_zero_raw is not None:
-                                    ch0_kg = self._calibration.ch0_m * (ch0_raw - self._calibration.ch0_zero_raw)
-                                else:
-                                    ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
-                            else:
-                                ch0_kg = (5.0/12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0/6.0)
-
-                            if self._calibration.ch1_poly2 is not None:
-                                a, b, c = self._calibration.ch1_poly2
-                                if self._calibration.ch1_zero_raw is not None:
-                                    x = ch1_raw - self._calibration.ch1_zero_raw
-                                    ch1_kg = (a * x * x) + (b * x) + c
-                                else:
-                                    ch1_kg = (a * ch1_raw * ch1_raw) + (b * ch1_raw) + c
-                            elif self._calibration.ch1_m is not None and self._calibration.ch1_b is not None:
-                                if self._calibration.ch1_zero_raw is not None:
-                                    ch1_kg = self._calibration.ch1_m * (ch1_raw - self._calibration.ch1_zero_raw)
-                                else:
-                                    ch1_kg = self._calibration.ch1_m * ch1_raw + self._calibration.ch1_b
-                            else:
-                                ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
-                        iadc = (packet.internal_adc / 1.78)
-                        batt_v = float(packet.battery_voltage)
+                            ch0_out, ch1_out = self._calibrate_channels(ch0_raw_ui, ch1_raw_ui)
+                        iadc = (ui_packet.internal_adc / 1.78)
+                        batt_v = float(ui_packet.battery_voltage)
                         self.sample.emit(
-                            float(t_mono),
-                            float(ch0_kg),
-                            float(ch1_kg),
+                            float(ui_t_mono),
+                            float(ch0_out),
+                            float(ch1_out),
                             int(iadc),
                             batt_v,
                         )
-                        last_ui_emit = t_mono
+                        last_ui_emit = ui_t_mono
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
+
+                now_rate = time.monotonic()
+                dt_rate = now_rate - last_rate_emit
+                if dt_rate >= rate_period:
+                    ingress_packets, ingress_bytes = self._take_ingress_totals()
+                    pkt_rate = float(ingress_packets - prev_ingress_packets) / dt_rate
+                    byte_rate = float(ingress_bytes - prev_ingress_bytes) / dt_rate
+                    prev_ingress_packets = ingress_packets
+                    prev_ingress_bytes = ingress_bytes
+                    self.data_rate.emit(byte_rate, pkt_rate)
+                    last_rate_emit = now_rate
 
         finally:
             self._reader_stop.set()
@@ -643,6 +703,7 @@ def main():
     # Telemetry -> GUI
     worker.sample.connect(win.on_sample)
     worker.raw_sample.connect(win.on_raw_sample)
+    worker.data_rate.connect(win.on_data_rate)
 
     # GUI -> Worker logging controls (queued across threads)
     win.start_saving.connect(worker.start_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)
@@ -651,6 +712,7 @@ def main():
     win.save_last_10s.connect(worker.save_last_10s, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.raw_stream_enabled.connect(worker.set_raw_stream_enabled, type=QtCore.Qt.ConnectionType.QueuedConnection)
+    win.display_raw_values.connect(worker.set_display_raw_values, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.sample_consumed.connect(worker.on_ui_sample_consumed, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI

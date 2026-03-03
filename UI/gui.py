@@ -274,6 +274,7 @@ class MainWindow(QtWidgets.QMainWindow):
     calibration_saved = QtCore.pyqtSignal()
     raw_stream_enabled = QtCore.pyqtSignal(bool)
     sample_consumed = QtCore.pyqtSignal()
+    display_raw_values = QtCore.pyqtSignal(bool)
 
     def __init__(
         self,
@@ -293,6 +294,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._history = int(history)
         self._window_seconds = float(initial_window_seconds)
+        self._default_window_seconds = float(initial_window_seconds)
         self._send_command = send_command
         self._plot_refresh_interval_s = 1.0 / 120.0
         self._last_plot_refresh_mono = 0.0
@@ -308,8 +310,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_calib_dialog: Optional[_CalibrationDialog] = None
 
         # Filter settings
-        self._filter_enabled = True
-        self._ema_alpha = 0.20  # 0..1
+        self._default_filter_enabled = True
+        self._default_ema_alpha = 0.20
+        self._filter_enabled = self._default_filter_enabled
+        self._ema_alpha = self._default_ema_alpha  # 0..1
 
         # EMA state (continues across samples; reset on clear)
         self._ema_ch0: Optional[float] = None
@@ -337,6 +341,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._max_ch1: Optional[float] = None
         self._max_iadc: Optional[float] = None
         self._max_batt: Optional[float] = None
+        self._min_ch0: Optional[float] = None
+        self._min_ch1: Optional[float] = None
+        self._min_iadc: Optional[float] = None
+        self._min_batt: Optional[float] = None
 
         # Calibration state
         self._calib_points_ch0: list[_CalPoint] = []
@@ -354,13 +362,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cal_stream_watchdog = QtCore.QTimer(self)
         self._cal_stream_watchdog.setInterval(500)
         self._cal_stream_watchdog.timeout.connect(self._on_cal_editor_watchdog)
+        self._calib_file_watcher = QtCore.QFileSystemWatcher(self)
+        self._calib_file_watcher.fileChanged.connect(self._on_calibration_file_changed)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
 
         # -------------------------------------------------
-        # Top row: max + current values
+        # Top row: max/current/min values
         # -------------------------------------------------
         top = QtWidgets.QHBoxLayout()
         layout.addLayout(top)
@@ -369,25 +379,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_ch1_lbl = QtWidgets.QLabel()
         self.max_iadc_lbl = QtWidgets.QLabel()
         self.max_batt_lbl = QtWidgets.QLabel()
+        self.min_ch0_lbl = QtWidgets.QLabel()
+        self.min_ch1_lbl = QtWidgets.QLabel()
+        self.min_iadc_lbl = QtWidgets.QLabel()
+        self.min_batt_lbl = QtWidgets.QLabel()
 
         self.cur_ch0_lbl = QtWidgets.QLabel("Cur Ch0: —")
         self.cur_ch1_lbl = QtWidgets.QLabel("Cur Ch1: —")
         self.cur_iadc_lbl = QtWidgets.QLabel("Cur IADC: —")
         self.cur_batt_lbl = QtWidgets.QLabel("Cur BattV: —")
+        self.data_rate_lbl = QtWidgets.QLabel("Rate: —")
 
-        for w in (
-            self.max_ch0_lbl,
-            self.max_ch1_lbl,
-            self.max_iadc_lbl,
-            self.max_batt_lbl,
-            self.cur_ch0_lbl,
-            self.cur_ch1_lbl,
-            self.cur_iadc_lbl,
-            self.cur_batt_lbl,
-        ):
-            w.setMinimumWidth(260)
-            top.addWidget(w)
+        cards = [
+            (self.max_ch0_lbl, self.cur_ch0_lbl, self.min_ch0_lbl),
+            (self.max_ch1_lbl, self.cur_ch1_lbl, self.min_ch1_lbl),
+            (self.max_iadc_lbl, self.cur_iadc_lbl, self.min_iadc_lbl),
+            (self.max_batt_lbl, self.cur_batt_lbl, self.min_batt_lbl),
+        ]
+        for max_lbl, cur_lbl, min_lbl in cards:
+            col = QtWidgets.QVBoxLayout()
+            max_lbl.setMinimumWidth(240)
+            cur_lbl.setMinimumWidth(240)
+            min_lbl.setMinimumWidth(240)
+            col.addWidget(max_lbl)
+            col.addWidget(cur_lbl)
+            col.addWidget(min_lbl)
+            top.addLayout(col)
 
+        self.data_rate_lbl.setMinimumWidth(220)
+        top.addWidget(self.data_rate_lbl)
         top.addStretch(1)
 
         # -------------------------------------------------
@@ -440,6 +460,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_value_lbl = QtWidgets.QLabel(f"{self._ema_alpha:.2f}")
         self.filter_value_lbl.setMinimumWidth(40)
         controls.addWidget(self.filter_value_lbl)
+
+        self.reset_window_btn = QtWidgets.QPushButton("Reset window")
+        self.reset_window_btn.clicked.connect(self._on_reset_window_control)
+        controls.addWidget(self.reset_window_btn)
+
+        self.reset_filter_btn = QtWidgets.QPushButton("Reset filter")
+        self.reset_filter_btn.clicked.connect(self._on_reset_filter_control)
+        controls.addWidget(self.reset_filter_btn)
+
+        self.raw_values_btn = QtWidgets.QPushButton("Show raw")
+        self.raw_values_btn.setCheckable(True)
+        self.raw_values_btn.toggled.connect(self._on_raw_values_toggled)
+        controls.addWidget(self.raw_values_btn)
 
         controls.addStretch(1)
 
@@ -528,19 +561,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calib_filename_edit = QtWidgets.QLineEdit()
         self.calib_filename_edit.setFixedWidth(320)
         self.calib_filename_edit.setPlaceholderText("loadcell_calibration.json")
+        self.calib_filename_edit.editingFinished.connect(self._on_calibration_filename_edited)
         calib_row.addWidget(self.calib_filename_edit)
 
         self.calib_ch0_btn = QtWidgets.QPushButton("Open Cal GUI")
         self.calib_ch0_btn.clicked.connect(self._open_external_calibration_gui)
         calib_row.addWidget(self.calib_ch0_btn)
 
-        self.calib_ch1_btn = QtWidgets.QPushButton("Reload calibration")
+        self.calib_ch1_btn = QtWidgets.QPushButton("Reload config")
         self.calib_ch1_btn.clicked.connect(self._reload_calibration_from_file)
         calib_row.addWidget(self.calib_ch1_btn)
-
-        self.calib_save_btn = QtWidgets.QPushButton("Save calibration")
-        self.calib_save_btn.clicked.connect(self._save_calibration)
-        calib_row.addWidget(self.calib_save_btn)
 
         self.calib_reset_btn = QtWidgets.QPushButton("Reset points")
         self.calib_reset_btn.clicked.connect(self._reset_calibration_points)
@@ -593,6 +623,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_calibration_filename(self, filename: str) -> None:
         self.calib_filename_edit.setText(filename)
+        self._refresh_calibration_watch()
 
     def _get_filename(self) -> str:
         name = self.filename_edit.text().strip()
@@ -601,6 +632,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def _get_calibration_filename(self) -> str:
         name = self.calib_filename_edit.text().strip()
         return name if name else "loadcell_calibration.json"
+
+    def _refresh_calibration_watch(self) -> None:
+        try:
+            watched = list(self._calib_file_watcher.files())
+            if watched:
+                self._calib_file_watcher.removePaths(watched)
+        except Exception:
+            pass
+        try:
+            path = Path(self._get_calibration_filename()).expanduser().resolve()
+            if path.exists():
+                self._calib_file_watcher.addPath(str(path))
+        except Exception:
+            pass
+
+    def _on_calibration_filename_edited(self) -> None:
+        self._refresh_calibration_watch()
+        self.calibration_saved.emit()
+        self.calib_status_lbl.setText("Calib: config path updated and reloaded")
+
+    def _on_calibration_file_changed(self, _path: str) -> None:
+        self.calibration_saved.emit()
+        self.calib_status_lbl.setText("Calib: auto-reloaded from calibration UI save")
+        QtCore.QTimer.singleShot(150, self._refresh_calibration_watch)
 
     def _sync_saving_ui(self) -> None:
         # Start visible only when not saving
@@ -772,6 +827,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_value_lbl.setText(f"{self._ema_alpha:.2f}")
         self._reset_filter_state()
 
+    def _on_reset_window_control(self) -> None:
+        self.window_slider.setValue(int(self._default_window_seconds))
+        self._recompute_window_maxes()
+        self._update_labels()
+        self._redraw()
+
+    def _on_reset_filter_control(self) -> None:
+        self.filter_chk.setChecked(self._default_filter_enabled)
+        self.filter_slider.setValue(int(round(self._default_ema_alpha * 100.0)))
+        self.filter_value_lbl.setText(f"{self._default_ema_alpha:.2f}")
+        self._reset_filter_state()
+        self._recompute_window_maxes()
+        self._update_labels()
+        self._redraw()
+
+    def _on_raw_values_toggled(self, checked: bool) -> None:
+        self.raw_values_btn.setText("Show calibrated" if checked else "Show raw")
+        self.display_raw_values.emit(bool(checked))
+
     def _reset_filter_state(self) -> None:
         self._ema_ch0 = None
         self._ema_ch1 = None
@@ -790,6 +864,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flt_batt.clear()
 
         self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
+        self._min_ch0 = self._min_ch1 = self._min_iadc = self._min_batt = None
         self._reset_filter_state()
         self._stream_t0_mono = None
         self._latest_sample = None
@@ -840,11 +915,16 @@ class MainWindow(QtWidgets.QMainWindow):
         xs, y0, y1, y2, y3 = self._get_active_series()
         if not xs:
             self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
+            self._min_ch0 = self._min_ch1 = self._min_iadc = self._min_batt = None
             return
         self._max_ch0 = max(y0) if y0 else None
         self._max_ch1 = max(y1) if y1 else None
         self._max_iadc = max(y2) if y2 else None
         self._max_batt = max(y3) if y3 else None
+        self._min_ch0 = min(y0) if y0 else None
+        self._min_ch1 = min(y1) if y1 else None
+        self._min_iadc = min(y2) if y2 else None
+        self._min_batt = min(y3) if y3 else None
 
     def _update_labels(self) -> None:
         def ff(v):
@@ -860,6 +940,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_ch1_lbl.setText(f"Max Ch1 ({ws}s) [{mode}]: {ff(self._max_ch1)}")
         self.max_iadc_lbl.setText(f"Max IADC ({ws}s) [{mode}]: {fi(self._max_iadc)}")
         self.max_batt_lbl.setText(f"Max BattV ({ws}s) [{mode}]: {ff(self._max_batt)}")
+        self.min_ch0_lbl.setText(f"Min Ch0 ({ws}s) [{mode}]: {ff(self._min_ch0)}")
+        self.min_ch1_lbl.setText(f"Min Ch1 ({ws}s) [{mode}]: {ff(self._min_ch1)}")
+        self.min_iadc_lbl.setText(f"Min IADC ({ws}s) [{mode}]: {fi(self._min_iadc)}")
+        self.min_batt_lbl.setText(f"Min BattV ({ws}s) [{mode}]: {ff(self._min_batt)}")
 
         if not self._xs:
             self.cur_ch0_lbl.setText("Cur Ch0: —")
@@ -897,6 +981,11 @@ class MainWindow(QtWidgets.QMainWindow):
             xmax = xs[-1]
             for p in (self.p0, self.p1, self.p2, self.p3):
                 p.setXRange(xmin, xmax, padding=0)
+
+    @QtCore.pyqtSlot(float, float)
+    def on_data_rate(self, bytes_per_s: float, packets_per_s: float) -> None:
+        kbps = (float(bytes_per_s) * 8.0) / 1000.0
+        self.data_rate_lbl.setText(f"Rate: {kbps:.1f} kbps ({packets_per_s:.0f} pkt/s)")
 
     # -------------------------------------------------
     # Data entry
@@ -1089,6 +1178,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _reload_calibration_from_file(self) -> None:
         self.calibration_saved.emit()
+        self._refresh_calibration_watch()
         self.calib_status_lbl.setText("Calib: reload requested")
 
     def _open_calibration_dialog(self, channel: int) -> None:
