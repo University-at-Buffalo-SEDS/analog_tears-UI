@@ -115,6 +115,7 @@ class RadioWorker(QtCore.QThread):
 
         # --- logging state ---
         self._logging_enabled = False
+        self._logging_paused = False
         self._csv_path: Optional[Path] = None
         self._csv_file = None
         self._csv_writer: Optional[csv.writer] = None
@@ -145,13 +146,21 @@ class RadioWorker(QtCore.QThread):
         self._csv_path = path
         self._open_csv_if_needed()
         self._logging_enabled = True
+        self._logging_paused = False
         self.status.emit(f"Saving: ON → {path.resolve()}")
 
     @QtCore.pyqtSlot()
     def stop_logging(self) -> None:
         self._logging_enabled = False
+        self._logging_paused = False
         self._close_csv()
         self.status.emit("Saving: OFF")
+
+    @QtCore.pyqtSlot(bool)
+    def set_logging_paused(self, paused: bool) -> None:
+        self._logging_paused = bool(paused)
+        if self._logging_enabled:
+            self.status.emit("Saving: PAUSED" if self._logging_paused else "Saving: RUNNING")
 
     @QtCore.pyqtSlot(str)
     def save_last_10s(self, filename: str) -> None:
@@ -452,7 +461,7 @@ class RadioWorker(QtCore.QThread):
                     self._recent.append(BufferedRow(t_mono=t_mono, key=key, row=row))
 
                     # CSV output (if enabled)
-                    if self._logging_enabled:
+                    if self._logging_enabled and (not self._logging_paused):
                         try:
                             self._open_csv_if_needed()
                             self._write_row_dedup(key, row)
@@ -550,6 +559,7 @@ def main():
     # GUI -> Worker logging controls (queued across threads)
     win.start_saving.connect(worker.start_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.stop_saving.connect(worker.stop_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)
+    win.pause_saving.connect(worker.set_logging_paused, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.save_last_10s.connect(worker.save_last_10s, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.raw_stream_enabled.connect(worker.set_raw_stream_enabled, type=QtCore.Qt.ConnectionType.QueuedConnection)

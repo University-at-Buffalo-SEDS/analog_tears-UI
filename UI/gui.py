@@ -5,6 +5,9 @@ import json
 import hashlib
 import hmac
 import math
+import socket
+import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -345,6 +348,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._calib_pending_progress_cb = None
         self._raw_ch0_recent = deque(maxlen=40)
         self._raw_ch1_recent = deque(maxlen=40)
+        self._cal_editor_proc: Optional[subprocess.Popen] = None
+        self._cal_stream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._cal_stream_addr: Optional[tuple[str, int]] = None
+        self._cal_stream_watchdog = QtCore.QTimer(self)
+        self._cal_stream_watchdog.setInterval(500)
+        self._cal_stream_watchdog.timeout.connect(self._on_cal_editor_watchdog)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -521,12 +530,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calib_filename_edit.setPlaceholderText("loadcell_calibration.json")
         calib_row.addWidget(self.calib_filename_edit)
 
-        self.calib_ch0_btn = QtWidgets.QPushButton("Calibrate Ch0…")
-        self.calib_ch0_btn.clicked.connect(lambda: self._open_calibration_dialog(0))
+        self.calib_ch0_btn = QtWidgets.QPushButton("Open Cal GUI")
+        self.calib_ch0_btn.clicked.connect(self._open_external_calibration_gui)
         calib_row.addWidget(self.calib_ch0_btn)
 
-        self.calib_ch1_btn = QtWidgets.QPushButton("Calibrate Ch1…")
-        self.calib_ch1_btn.clicked.connect(lambda: self._open_calibration_dialog(1))
+        self.calib_ch1_btn = QtWidgets.QPushButton("Reload calibration")
+        self.calib_ch1_btn.clicked.connect(self._reload_calibration_from_file)
         calib_row.addWidget(self.calib_ch1_btn)
 
         self.calib_save_btn = QtWidgets.QPushButton("Save calibration")
@@ -996,6 +1005,12 @@ class MainWindow(QtWidgets.QMainWindow):
         _ = t_mono  # timestamp retained in signal for future tuning
         self._raw_ch0_recent.append(float(ch0_raw))
         self._raw_ch1_recent.append(float(ch1_raw))
+        if self._cal_stream_addr is not None:
+            try:
+                payload = f"{float(t_mono):.6f},{float(ch0_raw):.9g},{float(ch1_raw):.9g}".encode("ascii")
+                self._cal_stream_sock.sendto(payload, self._cal_stream_addr)
+            except Exception:
+                pass
 
         # Calibration capture (averaging)
         if self._calib_pending_channel is None:
@@ -1029,6 +1044,53 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------
     # Calibration helpers
     # -------------------------------------------------
+    def _open_external_calibration_gui(self) -> None:
+        try:
+            if self._cal_editor_proc is not None and self._cal_editor_proc.poll() is None:
+                self.calib_status_lbl.setText("Calib: external editor already open")
+                return
+        except Exception:
+            self._cal_editor_proc = None
+
+        script = Path(__file__).with_name("edit_calibration_gui.py")
+        calib_path = self._get_calibration_filename()
+        try:
+            tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            tmp.bind(("127.0.0.1", 0))
+            raw_port = int(tmp.getsockname()[1])
+            tmp.close()
+            self._cal_stream_addr = ("127.0.0.1", raw_port)
+            self._cal_editor_proc = subprocess.Popen([
+                sys.executable,
+                str(script),
+                calib_path,
+                "--raw-port",
+                str(raw_port),
+            ])
+            self.raw_stream_enabled.emit(True)
+            self._cal_stream_watchdog.start()
+            self.calib_status_lbl.setText("Calib: opened external editor")
+        except Exception as e:
+            self._cal_stream_addr = None
+            self.calib_status_lbl.setText(f"Calib: failed to open editor ({e})")
+
+    def _on_cal_editor_watchdog(self) -> None:
+        if self._cal_editor_proc is None:
+            self._cal_stream_watchdog.stop()
+            self._cal_stream_addr = None
+            self.raw_stream_enabled.emit(False)
+            return
+        if self._cal_editor_proc.poll() is None:
+            return
+        self._cal_stream_watchdog.stop()
+        self._cal_editor_proc = None
+        self._cal_stream_addr = None
+        self.raw_stream_enabled.emit(False)
+
+    def _reload_calibration_from_file(self) -> None:
+        self.calibration_saved.emit()
+        self.calib_status_lbl.setText("Calib: reload requested")
+
     def _open_calibration_dialog(self, channel: int) -> None:
         if self._active_calib_dialog is not None:
             self._active_calib_dialog.raise_()
@@ -1081,6 +1143,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         dlg.finished.connect(on_finished)
         dlg.open()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._cal_stream_addr = None
+        self.raw_stream_enabled.emit(False)
+        try:
+            self._cal_stream_watchdog.stop()
+        except Exception:
+            pass
+        try:
+            self._cal_stream_sock.close()
+        except Exception:
+            pass
+        try:
+            if self._cal_editor_proc is not None and self._cal_editor_proc.poll() is None:
+                self._cal_editor_proc.terminate()
+                try:
+                    self._cal_editor_proc.wait(timeout=1.0)
+                except Exception:
+                    self._cal_editor_proc.kill()
+                    self._cal_editor_proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        self._cal_editor_proc = None
+        super().closeEvent(event)
 
     def _verify_igniter_password(self, password: str) -> bool:
         if not IGNITER_AUTH_FILE.exists():
