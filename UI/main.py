@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import argparse
+import signal
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +50,8 @@ class Calibration:
     ch1_b: Optional[float]
     ch1_poly2: Optional[tuple[float, float, float]]
     ch1_zero_raw: Optional[float]
+    iadc_m: Optional[float]
+    iadc_b: Optional[float]
 
 
 def load_calibration(path: Path) -> Optional[Calibration]:
@@ -58,6 +61,7 @@ def load_calibration(path: Path) -> Optional[Calibration]:
         data = json.loads(path.read_text())
         ch0 = data.get("ch0")
         ch1 = data.get("ch1")
+        iadc = data.get("iadc")
         ch0_fit = data.get("ch0_fit", {})
         ch1_fit = data.get("ch1_fit", {})
         ch0_poly2 = None
@@ -90,6 +94,8 @@ def load_calibration(path: Path) -> Optional[Calibration]:
             ch1_b=float(ch1["b"]) if ch1 and "b" in ch1 else None,
             ch1_poly2=ch1_poly2,
             ch1_zero_raw=float(data.get("ch1_zero_raw")) if data.get("ch1_zero_raw") is not None else None,
+            iadc_m=float(iadc["m"]) if iadc and "m" in iadc else None,
+            iadc_b=float(iadc["b"]) if iadc and "b" in iadc else None,
         )
     except Exception:
         return None
@@ -100,8 +106,8 @@ class RadioWorker(QtCore.QThread):
     Background serial read loop.
     Emits values to GUI and (optionally) logs to CSV.
     """
-    # t_mono, ch0(float), ch1(float), internal_adc(int), battery_voltage(float)
-    sample = QtCore.pyqtSignal(float, float, float, int, float)
+    # t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, tank_pressure, battery_voltage
+    sample = QtCore.pyqtSignal(float, float, float, float, float, float, float)
     raw_sample = QtCore.pyqtSignal(float, float, float)  # t_mono, ch0_raw, ch1_raw
     status = QtCore.pyqtSignal(str)
     data_rate = QtCore.pyqtSignal(float, float)  # bytes_per_s, packets_per_s
@@ -134,7 +140,6 @@ class RadioWorker(QtCore.QThread):
         self._csv_file = None
         self._csv_writer: Optional[csv.writer] = None
         self._raw_stream_enabled = False
-        self._display_raw_values = False
         self._ui_emit_in_flight = False
         self._reader_stop = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
@@ -236,10 +241,6 @@ class RadioWorker(QtCore.QThread):
     def set_raw_stream_enabled(self, enabled: bool) -> None:
         self._raw_stream_enabled = bool(enabled)
 
-    @QtCore.pyqtSlot(bool)
-    def set_display_raw_values(self, enabled: bool) -> None:
-        self._display_raw_values = bool(enabled)
-
     @QtCore.pyqtSlot()
     def on_ui_sample_consumed(self) -> None:
         self._ui_emit_in_flight = False
@@ -320,13 +321,14 @@ class RadioWorker(QtCore.QThread):
                 "Header",
                 "Seq",
                 "Timestamp",
-                "Ch0",
-                "Ch1",
-                "Internal ADC",
+                "50kg Raw",
+                "1000kg Raw",
+                "Tank Pressure Raw",
                 "Battery Voltage",
                 "CRC",
-                "Ch0_kg",
-                "Ch1_kg",
+                "50kg Calibrated",
+                "1000kg Calibrated",
+                "Tank Pressure Calibrated",
             ])
             self._write_calibration_row()
             self._csv_file.flush()
@@ -389,7 +391,8 @@ class RadioWorker(QtCore.QThread):
 
         ch0 = self._format_calib_value(self._calibration.ch0_m, self._calibration.ch0_b)
         ch1 = self._format_calib_value(self._calibration.ch1_m, self._calibration.ch1_b)
-        if not ch0 and not ch1:
+        iadc = self._format_calib_value(self._calibration.iadc_m, self._calibration.iadc_b)
+        if not ch0 and not ch1 and not iadc:
             return
 
         row = [
@@ -399,6 +402,7 @@ class RadioWorker(QtCore.QThread):
             "",
             ch0,
             ch1,
+            iadc,
             "",
             "",
             "",
@@ -448,6 +452,11 @@ class RadioWorker(QtCore.QThread):
             ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
 
         return float(ch0_kg), float(ch1_kg)
+
+    def _calibrate_tank_pressure(self, iadc_raw: float) -> float:
+        if self._calibration is not None and self._calibration.iadc_m is not None and self._calibration.iadc_b is not None:
+            return float(self._calibration.iadc_m * iadc_raw + self._calibration.iadc_b)
+        return float(iadc_raw / 1.78)
 
     # ----------------------------
     # Main worker loop
@@ -554,7 +563,8 @@ class RadioWorker(QtCore.QThread):
                         # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, battery_voltage, crc]
                         row = packet.to_csv_row(rx_timestamp)
                         ch0_kg_csv, ch1_kg_csv = self._calibrate_channels(ch0_raw, ch1_raw)
-                        row.extend([ch0_kg_csv, ch1_kg_csv])
+                        tank_p_csv = self._calibrate_tank_pressure(float(packet.internal_adc))
+                        row.extend([ch0_kg_csv, ch1_kg_csv, tank_p_csv])
                         key = CsvKey(
                             header=int(row[1]),
                             seq=int(row[2]),
@@ -592,18 +602,16 @@ class RadioWorker(QtCore.QThread):
                         last_raw_emit = ui_t_mono
 
                     if (ui_t_mono - last_ui_emit) >= ui_emit_period:
-                        if self._display_raw_values:
-                            ch0_out = float(ch0_raw_ui)
-                            ch1_out = float(ch1_raw_ui)
-                        else:
-                            ch0_out, ch1_out = self._calibrate_channels(ch0_raw_ui, ch1_raw_ui)
-                        iadc = (ui_packet.internal_adc / 1.78)
+                        ch0_cal, ch1_cal = self._calibrate_channels(ch0_raw_ui, ch1_raw_ui)
+                        tank_pressure = self._calibrate_tank_pressure(float(ui_packet.internal_adc))
                         batt_v = float(ui_packet.battery_voltage)
                         self.sample.emit(
                             float(ui_t_mono),
-                            float(ch0_out),
-                            float(ch1_out),
-                            int(iadc),
+                            float(ch0_raw_ui),
+                            float(ch1_raw_ui),
+                            float(ch0_cal),
+                            float(ch1_cal),
+                            float(tank_pressure),
                             batt_v,
                         )
                         last_ui_emit = ui_t_mono
@@ -688,6 +696,12 @@ def main():
 
     app = QtWidgets.QApplication([sys.argv[0], *qt_args])
 
+    # Allow Ctrl+C in terminal to close the Qt app cleanly.
+    signal.signal(signal.SIGINT, lambda _sig, _frame: app.quit())
+    sigint_pump = QtCore.QTimer()
+    sigint_pump.timeout.connect(lambda: None)
+    sigint_pump.start(100)
+
     worker = RadioWorker(
         com_port=com_port,
         calibration_path=calibration_path,
@@ -712,7 +726,6 @@ def main():
     win.save_last_10s.connect(worker.save_last_10s, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.raw_stream_enabled.connect(worker.set_raw_stream_enabled, type=QtCore.Qt.ConnectionType.QueuedConnection)
-    win.display_raw_values.connect(worker.set_display_raw_values, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.sample_consumed.connect(worker.on_ui_sample_consumed, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI

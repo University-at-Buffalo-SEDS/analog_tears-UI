@@ -304,9 +304,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._max_raw_lag_s = 0.300
         self._no_data_synth_delay_s = 0.100
         self._stream_t0_mono: Optional[float] = None
-        self._latest_sample: Optional[tuple[float, float, float, int, float]] = None
-        self._last_real_sample: Optional[tuple[float, float, float, int, float]] = None
-        self._prev_real_sample: Optional[tuple[float, float, float, int, float]] = None
+        self._latest_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
+        self._last_real_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
+        self._prev_real_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
+        self._show_raw_values = False
         self._active_calib_dialog: Optional[_CalibrationDialog] = None
 
         # Filter settings
@@ -329,6 +330,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_ch1 = deque(maxlen=self._history)
         self._raw_iadc = deque(maxlen=self._history)
         self._raw_batt = deque(maxlen=self._history)
+        self._hist_ch0_raw = deque(maxlen=self._history)
+        self._hist_ch1_raw = deque(maxlen=self._history)
+        self._hist_ch0_cal = deque(maxlen=self._history)
+        self._hist_ch1_cal = deque(maxlen=self._history)
 
         # Filtered series (EMA)
         self._flt_ch0 = deque(maxlen=self._history)
@@ -384,9 +389,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_iadc_lbl = QtWidgets.QLabel()
         self.min_batt_lbl = QtWidgets.QLabel()
 
-        self.cur_ch0_lbl = QtWidgets.QLabel("Cur Ch0: —")
-        self.cur_ch1_lbl = QtWidgets.QLabel("Cur Ch1: —")
-        self.cur_iadc_lbl = QtWidgets.QLabel("Cur IADC: —")
+        self.cur_ch0_lbl = QtWidgets.QLabel("Cur 50kg: —")
+        self.cur_ch1_lbl = QtWidgets.QLabel("Cur 1000kg: —")
+        self.cur_iadc_lbl = QtWidgets.QLabel("Cur Tank Pressure: —")
         self.cur_batt_lbl = QtWidgets.QLabel("Cur BattV: —")
         self.data_rate_lbl = QtWidgets.QLabel("Rate: —")
 
@@ -589,9 +594,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_widget = pg.GraphicsLayoutWidget()
         layout.addWidget(self.plot_widget, stretch=1)
 
-        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="Channel 0")
-        self.p1 = self.plot_widget.addPlot(row=1, col=0, title="Channel 1")
-        self.p2 = self.plot_widget.addPlot(row=2, col=0, title="Internal ADC")
+        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="50kg Channel")
+        self.p1 = self.plot_widget.addPlot(row=1, col=0, title="1000kg Channel")
+        self.p2 = self.plot_widget.addPlot(row=2, col=0, title="Tank Pressure")
         self.p3 = self.plot_widget.addPlot(row=3, col=0, title="Battery Voltage")
 
         for p in (self.p0, self.p1, self.p2, self.p3):
@@ -844,7 +849,63 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_raw_values_toggled(self, checked: bool) -> None:
         self.raw_values_btn.setText("Show calibrated" if checked else "Show raw")
-        self.display_raw_values.emit(bool(checked))
+        self._show_raw_values = bool(checked)
+        self._rebuild_display_series_from_history()
+        self._recompute_window_maxes()
+        self._update_labels()
+        self._redraw()
+
+    def _rebuild_display_series_from_history(self) -> None:
+        if not self._xs:
+            self._raw_ch0.clear()
+            self._raw_ch1.clear()
+            self._flt_ch0.clear()
+            self._flt_ch1.clear()
+            return
+
+        self._raw_ch0.clear()
+        self._raw_ch1.clear()
+        self._flt_ch0.clear()
+        self._flt_ch1.clear()
+        self._flt_iadc.clear()
+        self._flt_batt.clear()
+        self._reset_filter_state()
+
+        if self._show_raw_values:
+            src0 = list(self._hist_ch0_raw)
+            src1 = list(self._hist_ch1_raw)
+        else:
+            src0 = list(self._hist_ch0_cal)
+            src1 = list(self._hist_ch1_cal)
+        yi = list(self._raw_iadc)
+        yb = list(self._raw_batt)
+
+        n = min(len(src0), len(src1), len(yi), len(yb))
+        if n <= 0:
+            return
+
+        a = self._ema_alpha
+        for i in range(n):
+            c0 = float(src0[i])
+            c1 = float(src1[i])
+            ci = float(yi[i])
+            cb = float(yb[i])
+            self._raw_ch0.append(c0)
+            self._raw_ch1.append(c1)
+            if self._ema_ch0 is None:
+                self._ema_ch0 = c0
+                self._ema_ch1 = c1
+                self._ema_iadc = ci
+                self._ema_batt = cb
+            else:
+                self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * c0
+                self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * c1
+                self._ema_iadc = (1.0 - a) * self._ema_iadc + a * ci
+                self._ema_batt = (1.0 - a) * self._ema_batt + a * cb
+            self._flt_ch0.append(float(self._ema_ch0))
+            self._flt_ch1.append(float(self._ema_ch1))
+            self._flt_iadc.append(float(self._ema_iadc))
+            self._flt_batt.append(float(self._ema_batt))
 
     def _reset_filter_state(self) -> None:
         self._ema_ch0 = None
@@ -858,6 +919,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_ch1.clear()
         self._raw_iadc.clear()
         self._raw_batt.clear()
+        self._hist_ch0_raw.clear()
+        self._hist_ch1_raw.clear()
+        self._hist_ch0_cal.clear()
+        self._hist_ch1_cal.clear()
         self._flt_ch0.clear()
         self._flt_ch1.clear()
         self._flt_iadc.clear()
@@ -930,25 +995,22 @@ class MainWindow(QtWidgets.QMainWindow):
         def ff(v):
             return "—" if v is None else f"{v:.3f}"
 
-        def fi(v):
-            return "—" if v is None else f"{int(v)}"
-
         ws = int(self._window_seconds)
         mode = "F" if self._filter_enabled else "R"
 
-        self.max_ch0_lbl.setText(f"Max Ch0 ({ws}s) [{mode}]: {ff(self._max_ch0)}")
-        self.max_ch1_lbl.setText(f"Max Ch1 ({ws}s) [{mode}]: {ff(self._max_ch1)}")
-        self.max_iadc_lbl.setText(f"Max IADC ({ws}s) [{mode}]: {fi(self._max_iadc)}")
+        self.max_ch0_lbl.setText(f"Max 50kg ({ws}s) [{mode}]: {ff(self._max_ch0)}")
+        self.max_ch1_lbl.setText(f"Max 1000kg ({ws}s) [{mode}]: {ff(self._max_ch1)}")
+        self.max_iadc_lbl.setText(f"Max Tank Pressure ({ws}s) [{mode}]: {ff(self._max_iadc)}")
         self.max_batt_lbl.setText(f"Max BattV ({ws}s) [{mode}]: {ff(self._max_batt)}")
-        self.min_ch0_lbl.setText(f"Min Ch0 ({ws}s) [{mode}]: {ff(self._min_ch0)}")
-        self.min_ch1_lbl.setText(f"Min Ch1 ({ws}s) [{mode}]: {ff(self._min_ch1)}")
-        self.min_iadc_lbl.setText(f"Min IADC ({ws}s) [{mode}]: {fi(self._min_iadc)}")
+        self.min_ch0_lbl.setText(f"Min 50kg ({ws}s) [{mode}]: {ff(self._min_ch0)}")
+        self.min_ch1_lbl.setText(f"Min 1000kg ({ws}s) [{mode}]: {ff(self._min_ch1)}")
+        self.min_iadc_lbl.setText(f"Min Tank Pressure ({ws}s) [{mode}]: {ff(self._min_iadc)}")
         self.min_batt_lbl.setText(f"Min BattV ({ws}s) [{mode}]: {ff(self._min_batt)}")
 
         if not self._xs:
-            self.cur_ch0_lbl.setText("Cur Ch0: —")
-            self.cur_ch1_lbl.setText("Cur Ch1: —")
-            self.cur_iadc_lbl.setText("Cur IADC: —")
+            self.cur_ch0_lbl.setText("Cur 50kg: —")
+            self.cur_ch1_lbl.setText("Cur 1000kg: —")
+            self.cur_iadc_lbl.setText("Cur Tank Pressure: —")
             self.cur_batt_lbl.setText("Cur BattV: —")
             return
 
@@ -963,9 +1025,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ci = self._raw_iadc[-1] if self._raw_iadc else None
             cb = self._raw_batt[-1] if self._raw_batt else None
 
-        self.cur_ch0_lbl.setText(f"Cur Ch0 [{mode}]: {ff(c0)}")
-        self.cur_ch1_lbl.setText(f"Cur Ch1 [{mode}]: {ff(c1)}")
-        self.cur_iadc_lbl.setText(f"Cur IADC [{mode}]: {fi(ci)}")
+        self.cur_ch0_lbl.setText(f"Cur 50kg [{mode}]: {ff(c0)}")
+        self.cur_ch1_lbl.setText(f"Cur 1000kg [{mode}]: {ff(c1)}")
+        self.cur_iadc_lbl.setText(f"Cur Tank Pressure [{mode}]: {ff(ci)}")
         self.cur_batt_lbl.setText(f"Cur BattV [{mode}]: {ff(cb)}")
 
     def _redraw(self) -> None:
@@ -990,20 +1052,24 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------
     # Data entry
     # -------------------------------------------------
-    @QtCore.pyqtSlot(float, float, float, int, float)
+    @QtCore.pyqtSlot(float, float, float, float, float, float, float)
     def on_sample(
         self,
         t_mono: float,
-        ch0: float,
-        ch1: float,
-        internal_adc: int,
+        ch0_raw: float,
+        ch1_raw: float,
+        ch0_cal: float,
+        ch1_cal: float,
+        tank_pressure: float,
         battery_voltage: float,
     ) -> None:
         self._latest_sample = (
             float(t_mono),
-            float(ch0),
-            float(ch1),
-            int(internal_adc),
+            float(ch0_raw),
+            float(ch1_raw),
+            float(ch0_cal),
+            float(ch1_cal),
+            float(tank_pressure),
             float(battery_voltage),
         )
         self.sample_consumed.emit()
@@ -1011,9 +1077,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_processed_sample(
         self,
         t_mono: float,
-        ch0: float,
-        ch1: float,
-        internal_adc: int,
+        ch0_raw: float,
+        ch1_raw: float,
+        ch0_cal: float,
+        ch1_cal: float,
+        internal_adc: float,
         battery_voltage: float,
     ) -> None:
         if self._stream_t0_mono is None:
@@ -1021,9 +1089,15 @@ class MainWindow(QtWidgets.QMainWindow):
         t_seconds = t_mono - self._stream_t0_mono
 
         self._xs.append(float(t_seconds))
-        self._raw_ch0.append(float(ch0))
-        self._raw_ch1.append(float(ch1))
-        self._raw_iadc.append(int(internal_adc))
+        self._hist_ch0_raw.append(float(ch0_raw))
+        self._hist_ch1_raw.append(float(ch1_raw))
+        self._hist_ch0_cal.append(float(ch0_cal))
+        self._hist_ch1_cal.append(float(ch1_cal))
+        ch0 = float(ch0_raw) if self._show_raw_values else float(ch0_cal)
+        ch1 = float(ch1_raw) if self._show_raw_values else float(ch1_cal)
+        self._raw_ch0.append(ch0)
+        self._raw_ch1.append(ch1)
+        self._raw_iadc.append(float(internal_adc))
         self._raw_batt.append(float(battery_voltage))
 
         a = self._ema_alpha
@@ -1040,7 +1114,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._flt_ch0.append(float(self._ema_ch0))
         self._flt_ch1.append(float(self._ema_ch1))
-        self._flt_iadc.append(int(round(self._ema_iadc)))
+        self._flt_iadc.append(float(self._ema_iadc))
         self._flt_batt.append(float(self._ema_batt))
 
     def _consume_latest_sample(self) -> None:
@@ -1051,32 +1125,42 @@ class MainWindow(QtWidgets.QMainWindow):
         used_sample = False
 
         if self._latest_sample is not None:
-            t_mono, ch0, ch1, internal_adc, battery_voltage = self._latest_sample
+            t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, internal_adc, battery_voltage = self._latest_sample
             self._latest_sample = None
             if (now - t_mono) <= self._max_sample_lag_s:
-                self._append_processed_sample(t_mono, ch0, ch1, internal_adc, battery_voltage)
+                self._append_processed_sample(
+                    t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, internal_adc, battery_voltage
+                )
                 self._prev_real_sample = self._last_real_sample
-                self._last_real_sample = (t_mono, ch0, ch1, internal_adc, battery_voltage)
+                self._last_real_sample = (
+                    t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, internal_adc, battery_voltage
+                )
                 used_sample = True
 
         if (not used_sample) and (self._last_real_sample is not None):
-            last_t, last_c0, last_c1, last_iadc, last_batt = self._last_real_sample
+            last_t, last_c0_raw, last_c1_raw, last_c0_cal, last_c1_cal, last_iadc, last_batt = self._last_real_sample
             if (now - last_t) >= self._no_data_synth_delay_s:
-                slope_c0 = slope_c1 = slope_iadc = slope_batt = 0.0
+                slope_c0_raw = slope_c1_raw = slope_c0_cal = slope_c1_cal = slope_iadc = slope_batt = 0.0
                 if self._prev_real_sample is not None:
-                    prev_t, prev_c0, prev_c1, prev_iadc, prev_batt = self._prev_real_sample
+                    prev_t, prev_c0_raw, prev_c1_raw, prev_c0_cal, prev_c1_cal, prev_iadc, prev_batt = self._prev_real_sample
                     dt = last_t - prev_t
                     if dt > 1e-6:
-                        slope_c0 = (last_c0 - prev_c0) / dt
-                        slope_c1 = (last_c1 - prev_c1) / dt
+                        slope_c0_raw = (last_c0_raw - prev_c0_raw) / dt
+                        slope_c1_raw = (last_c1_raw - prev_c1_raw) / dt
+                        slope_c0_cal = (last_c0_cal - prev_c0_cal) / dt
+                        slope_c1_cal = (last_c1_cal - prev_c1_cal) / dt
                         slope_iadc = (float(last_iadc) - float(prev_iadc)) / dt
                         slope_batt = (last_batt - prev_batt) / dt
                 dt_now = now - last_t
-                synth_c0 = last_c0 + slope_c0 * dt_now
-                synth_c1 = last_c1 + slope_c1 * dt_now
-                synth_iadc = int(round(float(last_iadc) + slope_iadc * dt_now))
+                synth_c0_raw = last_c0_raw + slope_c0_raw * dt_now
+                synth_c1_raw = last_c1_raw + slope_c1_raw * dt_now
+                synth_c0_cal = last_c0_cal + slope_c0_cal * dt_now
+                synth_c1_cal = last_c1_cal + slope_c1_cal * dt_now
+                synth_iadc = float(last_iadc) + slope_iadc * dt_now
                 synth_batt = last_batt + slope_batt * dt_now
-                self._append_processed_sample(now, synth_c0, synth_c1, synth_iadc, synth_batt)
+                self._append_processed_sample(
+                    now, synth_c0_raw, synth_c1_raw, synth_c0_cal, synth_c1_cal, synth_iadc, synth_batt
+                )
                 used_sample = True
 
         if not used_sample:

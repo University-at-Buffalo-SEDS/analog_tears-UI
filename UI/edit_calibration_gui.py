@@ -278,6 +278,12 @@ class CalibrationEditor(QtWidgets.QWidget):
         grid.addWidget(self.ch1_m, 2, 1)
         grid.addWidget(self.ch1_b, 2, 2)
 
+        grid.addWidget(QtWidgets.QLabel("Tank Pressure"), 3, 0)
+        self.iadc_m = QtWidgets.QLineEdit()
+        self.iadc_b = QtWidgets.QLineEdit()
+        grid.addWidget(self.iadc_m, 3, 1)
+        grid.addWidget(self.iadc_b, 3, 2)
+
         zero_row = QtWidgets.QHBoxLayout()
         layout.addLayout(zero_row)
         zero_row.addWidget(QtWidgets.QLabel("Zero raw Ch0:"))
@@ -411,6 +417,9 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.ch0_b.setText("" if "b" not in ch0 or ch0["b"] is None else str(ch0["b"]))
         self.ch1_m.setText("" if "m" not in ch1 or ch1["m"] is None else str(ch1["m"]))
         self.ch1_b.setText("" if "b" not in ch1 or ch1["b"] is None else str(ch1["b"]))
+        iadc = data.get("iadc", {})
+        self.iadc_m.setText("" if "m" not in iadc or iadc["m"] is None else str(iadc["m"]))
+        self.iadc_b.setText("" if "b" not in iadc or iadc["b"] is None else str(iadc["b"]))
 
         self.ch0_zero.setText("" if data.get("ch0_zero_raw") is None else str(data.get("ch0_zero_raw")))
         self.ch1_zero.setText("" if data.get("ch1_zero_raw") is None else str(data.get("ch1_zero_raw")))
@@ -788,6 +797,8 @@ class CalibrationEditor(QtWidgets.QWidget):
             ch0_b = _get_float(self.ch0_b.text())
             ch1_m = _get_float(self.ch1_m.text())
             ch1_b = _get_float(self.ch1_b.text())
+            iadc_m = _get_float(self.iadc_m.text())
+            iadc_b = _get_float(self.iadc_b.text())
             ch0_zero = _get_float(self.ch0_zero.text())
             ch1_zero = _get_float(self.ch1_zero.text())
         except Exception as e:
@@ -800,6 +811,9 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._data["ch0"]["b"] = ch0_b
         self._data["ch1"]["m"] = ch1_m
         self._data["ch1"]["b"] = ch1_b
+        self._data.setdefault("iadc", {})
+        self._data["iadc"]["m"] = iadc_m
+        self._data["iadc"]["b"] = iadc_b
         self._data["ch0_zero_raw"] = ch0_zero
         self._data["ch1_zero_raw"] = ch1_zero
         self._data["points"] = [{"kg": kg, "ch0_raw": raw} for raw, kg in self._points0_xy]
