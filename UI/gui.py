@@ -268,6 +268,7 @@ class MainWindow(QtWidgets.QMainWindow):
     pause_saving = QtCore.pyqtSignal(bool)    # True=paused, False=running
     save_last_10s = QtCore.pyqtSignal(str)    # filename
     calibration_saved = QtCore.pyqtSignal()
+    raw_stream_enabled = QtCore.pyqtSignal(bool)
 
     def __init__(
         self,
@@ -288,11 +289,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._history = int(history)
         self._window_seconds = float(initial_window_seconds)
         self._send_command = send_command
-        self._plot_refresh_interval_s = 1.0 / 30.0
+        self._plot_refresh_interval_s = 1.0 / 120.0
         self._last_plot_refresh_mono = 0.0
+        self._stats_refresh_interval_s = 1.0 / 8.0
+        self._last_stats_refresh_mono = 0.0
         self._max_sample_lag_s = 0.200
         self._max_raw_lag_s = 0.300
         self._stream_t0_mono: Optional[float] = None
+        self._latest_sample: Optional[tuple[float, float, float, int, float]] = None
 
         # Filter settings
         self._filter_enabled = True
@@ -561,6 +565,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_labels()
         self._redraw()
 
+        self._frame_timer = QtCore.QTimer(self)
+        self._frame_timer.setInterval(8)  # ~120 Hz
+        self._frame_timer.timeout.connect(self._consume_latest_sample)
+        self._frame_timer.start()
+
     # -------------------------------------------------
     # Public helper (main.py convenience)
     # -------------------------------------------------
@@ -768,7 +777,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
         self._reset_filter_state()
         self._stream_t0_mono = None
+        self._latest_sample = None
         self._last_plot_refresh_mono = 0.0
+        self._last_stats_refresh_mono = 0.0
         self._update_labels()
         self._redraw()
 
@@ -777,6 +788,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._calib_points_ch1.clear()
         self._calib_pending_channel = None
         self._calib_pending_samples.clear()
+        self.raw_stream_enabled.emit(False)
         self.calib_status_lbl.setText("Calib: reset")
 
     # -------------------------------------------------
@@ -881,32 +893,48 @@ class MainWindow(QtWidgets.QMainWindow):
         internal_adc: int,
         battery_voltage: float,
     ) -> None:
+        self._latest_sample = (
+            float(t_mono),
+            float(ch0),
+            float(ch1),
+            int(internal_adc),
+            float(battery_voltage),
+        )
+
+    def _consume_latest_sample(self) -> None:
         if self._paused:
+            self._latest_sample = None
             return
+        if self._latest_sample is None:
+            return
+
+        t_mono, ch0, ch1, internal_adc, battery_voltage = self._latest_sample
+        self._latest_sample = None
+
         now_mono = time.monotonic()
-        if (now_mono - float(t_mono)) > self._max_sample_lag_s:
+        if (now_mono - t_mono) > self._max_sample_lag_s:
             return
         if self._stream_t0_mono is None:
-            self._stream_t0_mono = float(t_mono)
-        t_seconds = float(t_mono) - self._stream_t0_mono
+            self._stream_t0_mono = t_mono
+        t_seconds = t_mono - self._stream_t0_mono
 
-        self._xs.append(t_seconds)
-        self._raw_ch0.append(float(ch0))
-        self._raw_ch1.append(float(ch1))
-        self._raw_iadc.append(int(internal_adc))
-        self._raw_batt.append(float(battery_voltage))
+        self._xs.append(float(t_seconds))
+        self._raw_ch0.append(ch0)
+        self._raw_ch1.append(ch1)
+        self._raw_iadc.append(internal_adc)
+        self._raw_batt.append(battery_voltage)
 
         a = self._ema_alpha
         if self._ema_ch0 is None:
-            self._ema_ch0 = float(ch0)
-            self._ema_ch1 = float(ch1)
+            self._ema_ch0 = ch0
+            self._ema_ch1 = ch1
             self._ema_iadc = float(internal_adc)
-            self._ema_batt = float(battery_voltage)
+            self._ema_batt = battery_voltage
         else:
-            self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * float(ch0)
-            self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * float(ch1)
+            self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * ch0
+            self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * ch1
             self._ema_iadc = (1.0 - a) * self._ema_iadc + a * float(internal_adc)
-            self._ema_batt = (1.0 - a) * self._ema_batt + a * float(battery_voltage)
+            self._ema_batt = (1.0 - a) * self._ema_batt + a * battery_voltage
 
         self._flt_ch0.append(float(self._ema_ch0))
         self._flt_ch1.append(float(self._ema_ch1))
@@ -914,11 +942,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flt_batt.append(float(self._ema_batt))
 
         now = time.monotonic()
-        if (now - self._last_plot_refresh_mono) >= self._plot_refresh_interval_s:
+        self._redraw()
+        self._last_plot_refresh_mono = now
+        if (now - self._last_stats_refresh_mono) >= self._stats_refresh_interval_s:
             self._recompute_window_maxes()
             self._update_labels()
-            self._redraw()
-            self._last_plot_refresh_mono = now
+            self._last_stats_refresh_mono = now
 
     @QtCore.pyqtSlot(float, float, float)
     def on_raw_sample(self, t_mono: float, ch0_raw: float, ch1_raw: float) -> None:
@@ -951,6 +980,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._calib_pending_samples.clear()
             self._calib_pending_callback = None
             self._calib_pending_progress_cb = None
+            self.raw_stream_enabled.emit(False)
             if cb is not None:
                 cb(avg)
             if pcb is not None:
@@ -961,6 +991,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------
     def _open_calibration_dialog(self, channel: int) -> None:
         points = self._calib_points_ch0 if channel == 0 else self._calib_points_ch1
+        self.raw_stream_enabled.emit(True)
 
         def start_capture(ch: int, done_cb, progress_cb) -> None:
             if self._calib_pending_channel is not None:
@@ -990,6 +1021,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.calib_status_lbl.setText(
                 f"Calib: Ch{channel} points set ({len(new_points)} point(s))"
             )
+        if self._calib_pending_channel is None:
+            self.raw_stream_enabled.emit(False)
 
     def _verify_igniter_password(self, password: str) -> bool:
         if not IGNITER_AUTH_FILE.exists():

@@ -117,6 +117,7 @@ class RadioWorker(QtCore.QThread):
         self._csv_path: Optional[Path] = None
         self._csv_file = None
         self._csv_writer: Optional[csv.writer] = None
+        self._raw_stream_enabled = False
 
         # recent telemetry buffer (for “save last 10s”)
         self._recent: Deque[BufferedRow] = deque(maxlen=20000)  # plenty for high-rate
@@ -188,6 +189,10 @@ class RadioWorker(QtCore.QThread):
                     self._write_calibration_row()
                 except Exception as e:
                     self.status.emit(f"Calibration CSV write error: {e}")
+
+    @QtCore.pyqtSlot(bool)
+    def set_raw_stream_enabled(self, enabled: bool) -> None:
+        self._raw_stream_enabled = bool(enabled)
 
     # ----------------------------
     # CSV helpers (worker thread)
@@ -304,8 +309,8 @@ class RadioWorker(QtCore.QThread):
         last_status = ""
         last_ui_emit = 0.0
         last_raw_emit = 0.0
-        ui_emit_period = 1.0 / 60.0
-        raw_emit_period = 1.0 / 90.0
+        ui_emit_period = 1.0 / 120.0
+        raw_emit_period = 1.0 / 60.0
         seen_igniter_command = False
         turn_p_off = False
         p_start = time.monotonic()
@@ -353,6 +358,28 @@ class RadioWorker(QtCore.QThread):
 
                 # --- telemetry packet ---
                 packet = ev
+                if (not self._logging_enabled) and (self._csv_path is None) and (not self._raw_stream_enabled):
+                    # Under high-rate streaming, keep only the newest packet for UI.
+                    # This prevents unbounded "catch-up" latency growth.
+                    for _ in range(256):
+                        try:
+                            nxt = self.radio.poll_event()
+                        except Exception:
+                            break
+                        if nxt is None:
+                            break
+                        if isinstance(nxt, tuple):
+                            cmd, state = nxt
+                            self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
+                            if frontend_disable_pilot:
+                                if cmd == "I":
+                                    seen_igniter_command = True
+                                if seen_igniter_command and cmd == "P" and state is True:
+                                    turn_p_off = True
+                                    p_start = time.monotonic()
+                            continue
+                        packet = nxt
+
                 t_mono = time.monotonic()
                 ch0_raw = float(packet.channel0)
                 ch1_raw = float(packet.channel1)
@@ -387,7 +414,7 @@ class RadioWorker(QtCore.QThread):
 
                 # GUI update
                 try:
-                    if (t_mono - last_raw_emit) >= raw_emit_period:
+                    if self._raw_stream_enabled and (t_mono - last_raw_emit) >= raw_emit_period:
                         self.raw_sample.emit(float(t_mono), ch0_raw, ch1_raw)
                         last_raw_emit = t_mono
 
@@ -470,6 +497,7 @@ def main():
     win.stop_saving.connect(worker.stop_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.save_last_10s.connect(worker.save_last_10s, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
+    win.raw_stream_enabled.connect(worker.set_raw_stream_enabled, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI
     win.set_filename(DEFAULT_CSV_FILENAME)
