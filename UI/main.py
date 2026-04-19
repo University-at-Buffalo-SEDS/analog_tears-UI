@@ -320,6 +320,11 @@ class RadioWorker(QtCore.QThread):
 
     def _enqueue_event(self, ev, t_read_mono: float) -> None:
         with self._event_lock:
+            # Keep command ACKs ordered, but coalesce telemetry to newest-only.
+            # This prevents queue catch-up latency if producer briefly outruns consumer.
+            if not isinstance(ev, tuple):
+                while self._event_queue and (not isinstance(self._event_queue[-1][0], tuple)):
+                    self._event_queue.pop()
             if len(self._event_queue) >= self._event_queue.maxlen:
                 self._event_queue.popleft()
             self._event_queue.append((ev, t_read_mono))
@@ -339,6 +344,19 @@ class RadioWorker(QtCore.QThread):
             item = self._latest_display_packet
             self._latest_display_packet = None
             return item
+
+    def _clear_pending_rx_backlog(self) -> tuple[int, int]:
+        """
+        Drop buffered RX events so reconnect resumes at live data instead of
+        replaying stale queue history.
+        Returns (queued_events_dropped, latest_display_dropped_flag).
+        """
+        with self._event_lock:
+            dropped_events = len(self._event_queue)
+            self._event_queue.clear()
+            dropped_latest = 1 if self._latest_display_packet is not None else 0
+            self._latest_display_packet = None
+        return dropped_events, dropped_latest
 
     def _add_ingress_telemetry(self, packet_count: int, byte_count: int) -> None:
         with self._rate_lock:
@@ -551,6 +569,7 @@ class RadioWorker(QtCore.QThread):
         seen_igniter_command = False
         turn_p_off = False
         p_start = time.monotonic()
+        was_connected = False
 
         self._reader_stop.clear()
         self._reader_thread = threading.Thread(target=self._reader_loop, name="radio-reader", daemon=True)
@@ -559,20 +578,30 @@ class RadioWorker(QtCore.QThread):
         try:
             while not self._stop:
                 # --- connection management ---
-                if not self.radio.is_connected():
+                is_connected = self.radio.is_connected()
+                if not is_connected:
+                    if was_connected:
+                        dropped_events, dropped_latest = self._clear_pending_rx_backlog()
+                        if (dropped_events + dropped_latest) > 0:
+                            self.status.emit(
+                                f"Dropped stale backlog after disconnect "
+                                f"({dropped_events + dropped_latest} item(s))"
+                            )
                     ok = self.radio.reconnect()
                     new_status = "Reconnected" if ok else "Disconnected (retrying...)"
                     if new_status != last_status:
                         self.status.emit(new_status)
                         last_status = new_status
+                    was_connected = bool(ok)
                     time.sleep(0.25)
                     continue
+                was_connected = True
 
                 # --- unified RX (telemetry + ACKs) ---
                 display_only = (not self._logging_enabled) and (self._csv_path is None) and (not self._raw_stream_enabled)
                 self._low_latency_display_mode = display_only
 
-                want_crc = self._logging_enabled or (self._csv_path is not None) or self._raw_stream_enabled
+                want_crc = True
                 if want_crc != crc_verify_enabled:
                     self.radio.set_crc_verification(want_crc)
                     crc_verify_enabled = want_crc
