@@ -113,6 +113,8 @@ class RadioWorker(QtCore.QThread):
     raw_sample = QtCore.pyqtSignal(float, float, float, float)  # t_mono, ch0_raw, ch1_raw, iadc_raw
     status = QtCore.pyqtSignal(str)
     data_rate = QtCore.pyqtSignal(float, float)  # bytes_per_s, packets_per_s
+    ACK_GUARD_SECONDS = 0.5
+    ACK_WAIT_TIMEOUT_SECONDS = 2.0
 
     def __init__(
         self,
@@ -149,6 +151,12 @@ class RadioWorker(QtCore.QThread):
         self._event_lock = threading.Lock()
         self._low_latency_display_mode = True
         self._latest_display_packet: Optional[tuple[object, float]] = None
+        self._ack_guard_until = 0.0
+        self._ack_guard_lock = threading.Lock()
+        self._expected_acks: deque[tuple[str, bool, float]] = deque()
+        self._expected_acks_lock = threading.Lock()
+        self._tx_queue: deque[tuple[str, bool]] = deque()
+        self._tx_lock = threading.Lock()
         self._rate_lock = threading.Lock()
         self._ingress_packets = 0
         self._ingress_bytes = 0
@@ -223,7 +231,70 @@ class RadioWorker(QtCore.QThread):
         self.status.emit(f"Saved last 10s: wrote {wrote} row(s) → {path.resolve()}")
 
     def send_command(self, command: str, on: bool) -> None:
-        self.radio.send_command(command, on)
+        cmd = str(command).upper()[:1]
+        state = bool(on)
+        if not cmd:
+            return
+        self._register_expected_ack(command, on)
+        # Arm before TX so very fast ACKs are still protected.
+        self._arm_ack_guard(extra_s=self.ACK_WAIT_TIMEOUT_SECONDS)
+        with self._tx_lock:
+            self._tx_queue.append((cmd, state))
+
+    def _arm_ack_guard(self, extra_s: float = 0.0) -> None:
+        guard_for = max(0.0, self.ACK_GUARD_SECONDS + float(extra_s))
+        until = time.monotonic() + guard_for
+        with self._ack_guard_lock:
+            if until > self._ack_guard_until:
+                self._ack_guard_until = until
+
+    def _ack_guard_active(self) -> bool:
+        now = time.monotonic()
+        with self._ack_guard_lock:
+            if now < self._ack_guard_until:
+                return True
+        return self._has_pending_expected_ack(now)
+
+    def _register_expected_ack(self, command: str, on: bool) -> None:
+        cmd = str(command).upper()[:1]
+        state = bool(on)
+        deadline = time.monotonic() + self.ACK_WAIT_TIMEOUT_SECONDS
+        with self._expected_acks_lock:
+            self._expected_acks.append((cmd, state, deadline))
+
+    def _has_pending_expected_ack(self, now: float | None = None) -> bool:
+        t_now = time.monotonic() if now is None else now
+        with self._expected_acks_lock:
+            while self._expected_acks and self._expected_acks[0][2] < t_now:
+                self._expected_acks.popleft()
+            return bool(self._expected_acks)
+
+    def _consume_expected_ack(self, cmd: str, state: bool) -> None:
+        t_now = time.monotonic()
+        want_cmd = str(cmd).upper()[:1]
+        want_state = bool(state)
+        with self._expected_acks_lock:
+            if not self._expected_acks:
+                return
+            kept: deque[tuple[str, bool, float]] = deque()
+            consumed = False
+            while self._expected_acks:
+                exp_cmd, exp_state, deadline = self._expected_acks.popleft()
+                if deadline < t_now:
+                    continue
+                if (not consumed) and exp_cmd == want_cmd and exp_state == want_state:
+                    consumed = True
+                    continue
+                kept.append((exp_cmd, exp_state, deadline))
+            self._expected_acks = kept
+
+    def _drain_tx_queue(self) -> None:
+        pending: list[tuple[str, bool]] = []
+        with self._tx_lock:
+            while self._tx_queue:
+                pending.append(self._tx_queue.popleft())
+        for cmd, state in pending:
+            self.radio.send_command(cmd, state)
 
     @QtCore.pyqtSlot()
     def reload_calibration(self) -> None:
@@ -280,7 +351,8 @@ class RadioWorker(QtCore.QThread):
 
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
-            if self._low_latency_display_mode:
+            self._drain_tx_queue()
+            if self._low_latency_display_mode and (not self._ack_guard_active()):
                 # Keep latency low, but avoid over-aggressive flushing that can starve decoding.
                 self.radio.drop_os_backlog_if_needed(8192)
                 self.radio.prune_rx_buffer_to_latest(4096)
@@ -516,6 +588,7 @@ class RadioWorker(QtCore.QThread):
                 # --- ACK event ---
                 if isinstance(ev, tuple):
                     cmd, state = ev
+                    self._consume_expected_ack(cmd, state)
                     self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
                     if frontend_disable_pilot:
                         if cmd == "I":
@@ -544,6 +617,7 @@ class RadioWorker(QtCore.QThread):
                         nxt, nxt_t_mono = nxt_item
                         if isinstance(nxt, tuple):
                             cmd, state = nxt
+                            self._consume_expected_ack(cmd, state)
                             self.status.emit(f"ACK: {cmd} {'ON' if state else 'OFF'}")
                             if frontend_disable_pilot:
                                 if cmd == "I":

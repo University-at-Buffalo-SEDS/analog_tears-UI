@@ -132,5 +132,14 @@ class PacketHandler:
         if PacketHandler.crc8_xor(data[:3]) != data[3]:
             return None
         cmd_char = chr(data[1])
-        state = bool(data[2])
+        val = int(data[2]) & 0xFF
+        if val == PacketHandler.CMD_ON:
+            state = True
+        elif val == PacketHandler.CMD_OFF:
+            state = False
+        elif val in (0, 1):
+            # Backward-compatible fallback for firmware that acks with boolean values.
+            state = bool(val)
+        else:
+            return None
         return cmd_char, state

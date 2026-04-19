@@ -86,6 +86,19 @@ class Radio:
             self._rx_buf.clear()
             return None
 
+        # If a packet header appears first but is incomplete while a full ACK is already
+        # in the buffer, process the ACK first so command replies are not blocked.
+        if (
+            i_pkt != -1
+            and i_ack != -1
+            and i_pkt < i_ack
+            and (len(self._rx_buf) - i_pkt) < PacketHandler.PACKET_SIZE
+            and (len(self._rx_buf) - i_ack) >= 4
+        ):
+            del self._rx_buf[:i_ack]
+            i_pkt = -1
+            i_ack = 0
+
         # choose earliest header so we stay in-order
         if i_pkt == -1:
             kind, idx = "ack", i_ack
@@ -231,9 +244,10 @@ class Radio:
             if chunk:
                 self._rx_buf += chunk
 
-            # keep buffer bounded
-            if len(self._rx_buf) > 4096:
-                self._rx_buf = self._rx_buf[-4096:]
+            # Keep parser buffer bounded, but allow enough headroom for high-rate bursts.
+            # A very small cap can drop short control frames (ACKs) before they are parsed.
+            if len(self._rx_buf) > 65536:
+                self._rx_buf = self._rx_buf[-65536:]
 
         except (SerialException, OSError) as e:
             self._mark_disconnected(str(e))
