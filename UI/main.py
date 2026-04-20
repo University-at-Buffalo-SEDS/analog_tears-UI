@@ -148,7 +148,8 @@ class RadioWorker(QtCore.QThread):
         self._ui_emit_in_flight = False
         self._reader_stop = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
-        self._event_queue: deque = deque(maxlen=5000)
+        # Unbounded queue: do not silently drop telemetry while saving.
+        self._event_queue: deque = deque()
         self._event_lock = threading.Lock()
         self._low_latency_display_mode = True
         self._latest_display_packet: Optional[tuple[object, float]] = None
@@ -326,15 +327,13 @@ class RadioWorker(QtCore.QThread):
     def on_ui_sample_consumed(self) -> None:
         self._ui_emit_in_flight = False
 
-    def _enqueue_event(self, ev, t_read_mono: float) -> None:
+    def _enqueue_event(self, ev, t_read_mono: float, *, coalesce_telemetry: bool = False) -> None:
         with self._event_lock:
-            # Keep command ACKs ordered, but coalesce telemetry to newest-only.
-            # This prevents queue catch-up latency if producer briefly outruns consumer.
-            if not isinstance(ev, tuple):
+            # Keep command ACKs ordered.
+            # Optional telemetry coalescing is only for lowest-latency display paths.
+            if coalesce_telemetry and (not isinstance(ev, tuple)):
                 while self._event_queue and (not isinstance(self._event_queue[-1][0], tuple)):
                     self._event_queue.pop()
-            if len(self._event_queue) >= self._event_queue.maxlen:
-                self._event_queue.popleft()
             self._event_queue.append((ev, t_read_mono))
 
     def _dequeue_event(self):
@@ -407,8 +406,12 @@ class RadioWorker(QtCore.QThread):
                 self._add_ingress_telemetry(1, PacketHandler.PACKET_SIZE)
                 # Always keep newest telemetry packet available for low-latency UI display.
                 self._set_latest_display_packet(ev, t_now)
-                if self._low_latency_display_mode or (t_now < self._force_live_until):
+                full_fidelity_required = self._logging_enabled or (self._csv_path is not None)
+                low_latency_only = self._low_latency_display_mode or (t_now < self._force_live_until)
+                if low_latency_only and (not full_fidelity_required):
                     continue
+                self._enqueue_event(ev, t_now, coalesce_telemetry=False)
+                continue
             self._enqueue_event(ev, t_now)
 
     # ----------------------------
