@@ -237,9 +237,10 @@ class Radio:
             except Exception:
                 n = 0
 
-            if n <= 0:
-                return
-            chunk = self.ser.read(n)
+            # Some adapters briefly report in_waiting=0 after reconnect despite
+            # having data shortly after; do a minimal read attempt in that case.
+            read_n = n if n > 0 else 1
+            chunk = self.ser.read(read_n)
 
             if chunk:
                 self._rx_buf += chunk
@@ -272,6 +273,27 @@ class Radio:
             pass
         self._rx_buf.clear()
         return pending
+
+    def clear_backlog(self) -> tuple[int, int]:
+        """
+        Force-drop all pending serial and parser backlog.
+        Returns (os_pending_before_flush, internal_rx_bytes_dropped).
+        """
+        if self.simulate or not self.ser:
+            dropped_internal = len(self._rx_buf)
+            self._rx_buf.clear()
+            return 0, dropped_internal
+        try:
+            pending = int(self.ser.in_waiting or 0)
+        except Exception:
+            pending = 0
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        dropped_internal = len(self._rx_buf)
+        self._rx_buf.clear()
+        return pending, dropped_internal
 
     def prune_rx_buffer_to_latest(self, keep_bytes: int = 256) -> int:
         """

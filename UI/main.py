@@ -113,6 +113,7 @@ class RadioWorker(QtCore.QThread):
     raw_sample = QtCore.pyqtSignal(float, float, float, float)  # t_mono, ch0_raw, ch1_raw, iadc_raw
     status = QtCore.pyqtSignal(str)
     data_rate = QtCore.pyqtSignal(float, float)  # bytes_per_s, packets_per_s
+    link_state = QtCore.pyqtSignal(bool)  # True=connected, False=disconnected
     ACK_GUARD_SECONDS = 0.5
     ACK_WAIT_TIMEOUT_SECONDS = 2.0
 
@@ -160,6 +161,8 @@ class RadioWorker(QtCore.QThread):
         self._rate_lock = threading.Lock()
         self._ingress_packets = 0
         self._ingress_bytes = 0
+        self._post_reconnect_grace_until = 0.0
+        self._force_live_until = 0.0
 
         # recent telemetry buffer (for “save last 10s”)
         self._recent: Deque[BufferedRow] = deque(maxlen=20000)  # plenty for high-rate
@@ -167,6 +170,11 @@ class RadioWorker(QtCore.QThread):
         # dedupe for current file
         self._written_keys: Deque[CsvKey] = deque(maxlen=100000)  # bounds memory
         self._written_set: set[CsvKey] = set()
+
+    def _start_reader_thread(self) -> None:
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, name="radio-reader", daemon=True)
+        self._reader_thread.start()
 
     def stop(self) -> None:
         self._stop = True
@@ -369,26 +377,37 @@ class RadioWorker(QtCore.QThread):
 
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
-            self._drain_tx_queue()
-            if self._low_latency_display_mode and (not self._ack_guard_active()):
-                # Keep latency low, but avoid over-aggressive flushing that can starve decoding.
-                self.radio.drop_os_backlog_if_needed(8192)
-                self.radio.prune_rx_buffer_to_latest(4096)
             try:
+                self._drain_tx_queue()
+                now = time.monotonic()
+                in_reconnect_grace = now < self._post_reconnect_grace_until
+                force_live = now < self._force_live_until
+                if (self._low_latency_display_mode or force_live) and (not self._ack_guard_active()):
+                    # After reconnect, trim more aggressively so UI snaps to live data.
+                    if force_live:
+                        self.radio.drop_os_backlog_if_needed(64)
+                        self.radio.prune_rx_buffer_to_latest(128)
+                    elif in_reconnect_grace:
+                        self.radio.drop_os_backlog_if_needed(256)
+                        self.radio.prune_rx_buffer_to_latest(512)
+                    else:
+                        # Keep latency low, but avoid over-aggressive flushing that can starve decoding.
+                        self.radio.drop_os_backlog_if_needed(8192)
+                        self.radio.prune_rx_buffer_to_latest(4096)
                 ev = self.radio.poll_event()
             except Exception:
                 time.sleep(0.001)
                 continue
             if ev is None:
                 # Yield CPU to keep UI responsive during high-rate test/sim loops.
-                time.sleep(0.0001 if self.radio.simulate else 0.0005)
+                time.sleep(0.0001 if self.radio.simulate else 0.0002)
                 continue
             t_now = time.monotonic()
             if not isinstance(ev, tuple):
                 self._add_ingress_telemetry(1, PacketHandler.PACKET_SIZE)
                 # Always keep newest telemetry packet available for low-latency UI display.
                 self._set_latest_display_packet(ev, t_now)
-                if self._low_latency_display_mode:
+                if self._low_latency_display_mode or (t_now < self._force_live_until):
                     continue
             self._enqueue_event(ev, t_now)
 
@@ -559,8 +578,8 @@ class RadioWorker(QtCore.QThread):
         last_status = ""
         last_ui_emit = 0.0
         last_raw_emit = 0.0
-        ui_emit_period = 1.0 / 120.0
-        raw_emit_period = 1.0 / 60.0
+        ui_emit_period = 1.0 / 240.0
+        raw_emit_period = 1.0 / 120.0
         rate_period = 0.25
         last_rate_emit = time.monotonic()
         prev_ingress_packets = 0
@@ -570,13 +589,18 @@ class RadioWorker(QtCore.QThread):
         turn_p_off = False
         p_start = time.monotonic()
         was_connected = False
+        last_link_state: Optional[bool] = None
+        no_data_reconnect_s = 0.75
+        last_rx_item_mono = time.monotonic()
+        last_no_data_status = 0.0
 
-        self._reader_stop.clear()
-        self._reader_thread = threading.Thread(target=self._reader_loop, name="radio-reader", daemon=True)
-        self._reader_thread.start()
+        self._start_reader_thread()
 
         try:
             while not self._stop:
+                if (self._reader_thread is None) or (not self._reader_thread.is_alive()):
+                    self.status.emit("Reader thread restarted")
+                    self._start_reader_thread()
                 # --- connection management ---
                 is_connected = self.radio.is_connected()
                 if not is_connected:
@@ -592,10 +616,30 @@ class RadioWorker(QtCore.QThread):
                     if new_status != last_status:
                         self.status.emit(new_status)
                         last_status = new_status
+                    if last_link_state is not bool(ok):
+                        self.link_state.emit(bool(ok))
+                        last_link_state = bool(ok)
+                    if ok:
+                        # On reconnect, hard-flush stale serial/parser/event backlog.
+                        dropped_os, dropped_rx = self.radio.clear_backlog()
+                        dropped_events, dropped_latest = self._clear_pending_rx_backlog()
+                        dropped_total = dropped_os + dropped_rx + dropped_events + dropped_latest
+                        if dropped_total > 0:
+                            self.status.emit(f"Reconnect sync: dropped {dropped_total} stale item(s)")
+                        now_ok = time.monotonic()
+                        # Short grace window uses aggressive low-latency trimming in reader loop.
+                        self._post_reconnect_grace_until = now_ok + 0.4
+                        # For a few seconds after reconnect, force newest-only telemetry
+                        # to avoid replaying stale buffered stream.
+                        self._force_live_until = now_ok + 5.0
+                        last_rx_item_mono = now_ok
                     was_connected = bool(ok)
-                    time.sleep(0.25)
+                    time.sleep(0.01 if ok else 0.10)
                     continue
                 was_connected = True
+                if last_link_state is not True:
+                    self.link_state.emit(True)
+                    last_link_state = True
 
                 # --- unified RX (telemetry + ACKs) ---
                 display_only = (not self._logging_enabled) and (self._csv_path is None) and (not self._raw_stream_enabled)
@@ -607,12 +651,26 @@ class RadioWorker(QtCore.QThread):
                     crc_verify_enabled = want_crc
 
                 item = self._dequeue_event()
-                if item is None and display_only:
+                if item is None and (display_only or (time.monotonic() < self._force_live_until)):
                     item = self._take_latest_display_packet()
                 if item is None:
-                    time.sleep(0.0005)
+                    now = time.monotonic()
+                    if (now - last_rx_item_mono) >= no_data_reconnect_s:
+                        if (now - last_no_data_status) >= 1.0:
+                            self.status.emit("No data (forcing reconnect...)")
+                            last_no_data_status = now
+                        try:
+                            self.radio.close()
+                        except Exception:
+                            pass
+                        was_connected = False
+                        self._post_reconnect_grace_until = 0.0
+                        time.sleep(0.01)
+                        continue
+                    time.sleep(0.0001)
                     continue
                 ev, ev_t_mono = item
+                last_rx_item_mono = time.monotonic()
 
                 # --- ACK event ---
                 if isinstance(ev, tuple):
@@ -749,6 +807,8 @@ class RadioWorker(QtCore.QThread):
             except Exception:
                 pass
             self._close_csv()
+            if last_link_state is not False:
+                self.link_state.emit(False)
             self.status.emit("Radio closed.")
 
 
@@ -827,6 +887,7 @@ def main():
     worker.sample.connect(win.on_sample)
     worker.raw_sample.connect(win.on_raw_sample)
     worker.data_rate.connect(win.on_data_rate)
+    worker.link_state.connect(win.set_link_connected)
 
     # GUI -> Worker logging controls (queued across threads)
     win.start_saving.connect(worker.start_logging, type=QtCore.Qt.ConnectionType.QueuedConnection)

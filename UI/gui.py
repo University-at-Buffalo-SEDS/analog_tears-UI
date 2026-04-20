@@ -300,9 +300,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_plot_refresh_mono = 0.0
         self._stats_refresh_interval_s = 1.0 / 8.0
         self._last_stats_refresh_mono = 0.0
-        self._max_sample_lag_s = 0.200
+        self._max_sample_lag_s = 0.080
         self._max_raw_lag_s = 0.300
         self._no_data_synth_delay_s = 0.100
+        self._no_data_synth_max_age_s = 0.250
+        self._link_connected = False
         self._stream_t0_mono: Optional[float] = None
         self._latest_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
         self._last_real_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
@@ -311,8 +313,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_calib_dialog: Optional[_CalibrationDialog] = None
 
         # Filter settings
-        self._default_filter_enabled = True
-        self._default_ema_alpha = 0.20
+        self._default_filter_enabled = False
+        self._default_ema_alpha = 0.35
         self._filter_enabled = self._default_filter_enabled
         self._ema_alpha = self._default_ema_alpha  # 0..1
 
@@ -612,7 +614,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._redraw()
 
         self._frame_timer = QtCore.QTimer(self)
-        self._frame_timer.setInterval(8)  # ~120 Hz
+        self._frame_timer.setInterval(4)  # ~250 Hz
         self._frame_timer.timeout.connect(self._consume_latest_sample)
         self._frame_timer.start()
 
@@ -1045,6 +1047,16 @@ class MainWindow(QtWidgets.QMainWindow):
         kbps = (float(bytes_per_s) * 8.0) / 1000.0
         self.data_rate_lbl.setText(f"Rate: {kbps:.1f} kbps ({packets_per_s:.0f} pkt/s)")
 
+    @QtCore.pyqtSlot(bool)
+    def set_link_connected(self, connected: bool) -> None:
+        self._link_connected = bool(connected)
+        if not self._link_connected:
+            # Do not consume stale in-flight samples once the link drops.
+            self._latest_sample = None
+            # Prevent disconnected-era extrapolation from affecting reconnect.
+            self._last_real_sample = None
+            self._prev_real_sample = None
+
     # -------------------------------------------------
     # Data entry
     # -------------------------------------------------
@@ -1123,39 +1135,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._latest_sample is not None:
             t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, internal_adc, battery_voltage = self._latest_sample
             self._latest_sample = None
-            if (now - t_mono) <= self._max_sample_lag_s:
+            sample_age = now - t_mono
+            if sample_age > self._max_sample_lag_s:
+                # After reconnect/idle gaps, accept the first returned packet and
+                # stamp it to "now" so plotting can resume immediately.
+                if (self._last_real_sample is None) or ((now - self._last_real_sample[0]) > self._no_data_synth_max_age_s):
+                    t_mono = now
+                    sample_age = 0.0
+            if sample_age <= self._max_sample_lag_s:
                 self._append_processed_sample(
                     t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, internal_adc, battery_voltage
                 )
                 self._prev_real_sample = self._last_real_sample
                 self._last_real_sample = (
                     t_mono, ch0_raw, ch1_raw, ch0_cal, ch1_cal, internal_adc, battery_voltage
-                )
-                used_sample = True
-
-        if (not used_sample) and (self._last_real_sample is not None):
-            last_t, last_c0_raw, last_c1_raw, last_c0_cal, last_c1_cal, last_iadc, last_batt = self._last_real_sample
-            if (now - last_t) >= self._no_data_synth_delay_s:
-                slope_c0_raw = slope_c1_raw = slope_c0_cal = slope_c1_cal = slope_iadc = slope_batt = 0.0
-                if self._prev_real_sample is not None:
-                    prev_t, prev_c0_raw, prev_c1_raw, prev_c0_cal, prev_c1_cal, prev_iadc, prev_batt = self._prev_real_sample
-                    dt = last_t - prev_t
-                    if dt > 1e-6:
-                        slope_c0_raw = (last_c0_raw - prev_c0_raw) / dt
-                        slope_c1_raw = (last_c1_raw - prev_c1_raw) / dt
-                        slope_c0_cal = (last_c0_cal - prev_c0_cal) / dt
-                        slope_c1_cal = (last_c1_cal - prev_c1_cal) / dt
-                        slope_iadc = (float(last_iadc) - float(prev_iadc)) / dt
-                        slope_batt = (last_batt - prev_batt) / dt
-                dt_now = now - last_t
-                synth_c0_raw = last_c0_raw + slope_c0_raw * dt_now
-                synth_c1_raw = last_c1_raw + slope_c1_raw * dt_now
-                synth_c0_cal = last_c0_cal + slope_c0_cal * dt_now
-                synth_c1_cal = last_c1_cal + slope_c1_cal * dt_now
-                synth_iadc = float(last_iadc) + slope_iadc * dt_now
-                synth_batt = last_batt + slope_batt * dt_now
-                self._append_processed_sample(
-                    now, synth_c0_raw, synth_c1_raw, synth_c0_cal, synth_c1_cal, synth_iadc, synth_batt
                 )
                 used_sample = True
 
