@@ -54,7 +54,7 @@ class _CalibrationDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
 
         self.info_lbl = QtWidgets.QLabel(
-            "Step 1 sets the 0 kg point. After that you can enter any whole kg value."
+            "Step 1 sets the 0 kg point. After that you can enter positive or negative kg values."
         )
         layout.addWidget(self.info_lbl)
 
@@ -119,7 +119,7 @@ class _CalibrationDialog(QtWidgets.QDialog):
             dlg.setWindowTitle("Next calibration point")
             dlg.setLabelText("Enter next weight (kg):")
             dlg.setDoubleDecimals(2)
-            dlg.setDoubleRange(0.0, 10000.0)
+            dlg.setDoubleRange(-10000.0, 10000.0)
             dlg.setDoubleValue(float(self._points[-1].weight))
             dlg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
 
@@ -205,7 +205,7 @@ class _CalibrationDialog(QtWidgets.QDialog):
         dlg.setWindowTitle("Edit point weight")
         dlg.setLabelText("Enter weight (kg):")
         dlg.setDoubleDecimals(2)
-        dlg.setDoubleRange(0.0, 10000.0)
+        dlg.setDoubleRange(-10000.0, 10000.0)
         dlg.setDoubleValue(float(p.weight))
         dlg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
 
@@ -323,6 +323,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ema_ch1: Optional[float] = None
         self._ema_iadc: Optional[float] = None
         self._ema_batt: Optional[float] = None
+        self._ema_load: Optional[float] = None
 
         # Full history buffers (DO NOT time-trim; only capped by history samples)
         self._xs = deque(maxlen=self._history)
@@ -336,12 +337,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hist_ch1_raw = deque(maxlen=self._history)
         self._hist_ch0_cal = deque(maxlen=self._history)
         self._hist_ch1_cal = deque(maxlen=self._history)
+        self._hist_load_raw = deque(maxlen=self._history)
+        self._hist_load_cal = deque(maxlen=self._history)
 
         # Filtered series (EMA)
         self._flt_ch0 = deque(maxlen=self._history)
         self._flt_ch1 = deque(maxlen=self._history)
         self._flt_iadc = deque(maxlen=self._history)
         self._flt_batt = deque(maxlen=self._history)
+        self._raw_load = deque(maxlen=self._history)
+        self._flt_load = deque(maxlen=self._history)
 
         # Cached window maxes (computed over currently displayed series)
         self._max_ch0: Optional[float] = None
@@ -391,8 +396,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_iadc_lbl = QtWidgets.QLabel()
         self.min_batt_lbl = QtWidgets.QLabel()
 
-        self.cur_ch0_lbl = QtWidgets.QLabel("Cur 50kg: —")
-        self.cur_ch1_lbl = QtWidgets.QLabel("Cur 1000kg: —")
+        self.cur_ch0_lbl = QtWidgets.QLabel("Cur Weight: —")
+        self.cur_ch1_lbl = QtWidgets.QLabel("Cur Thrust: —")
         self.cur_iadc_lbl = QtWidgets.QLabel("Cur Tank Pressure: —")
         self.cur_batt_lbl = QtWidgets.QLabel("Cur BattV: —")
         self.data_rate_lbl = QtWidgets.QLabel("Rate: —")
@@ -592,17 +597,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_widget = pg.GraphicsLayoutWidget()
         layout.addWidget(self.plot_widget, stretch=1)
 
-        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="50kg Channel")
-        self.p1 = self.plot_widget.addPlot(row=1, col=0, title="1000kg Channel")
-        self.p2 = self.plot_widget.addPlot(row=2, col=0, title="Tank Pressure")
-        self.p3 = self.plot_widget.addPlot(row=3, col=0, title="Battery Voltage")
+        self.p_load = self.plot_widget.addPlot(row=0, col=0, title="1000kg Load Cell: Weight / Thrust")
+        self.p2 = self.plot_widget.addPlot(row=1, col=0, title="Tank Pressure")
+        self.p3 = self.plot_widget.addPlot(row=2, col=0, title="Battery Voltage")
 
-        for p in (self.p0, self.p1, self.p2, self.p3):
+        for p in (self.p_load, self.p2, self.p3):
             p.showGrid(x=True, y=True)
             p.setLabel("bottom", "Time (s)")
 
-        self.c0 = self.p0.plot([], [])
-        self.c1 = self.p1.plot([], [])
+        self.c0 = self.p_load.plot([], [], pen=pg.mkPen((255, 215, 0), width=2))
+        self.c1 = self.p_load.plot([], [], pen=None)
+        self.c1.setVisible(False)
         self.c2 = self.p2.plot([], [])
         self.c3 = self.p3.plot([], [])
         for c in (self.c0, self.c1, self.c2, self.c3):
@@ -859,6 +864,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._raw_ch1.clear()
             self._flt_ch0.clear()
             self._flt_ch1.clear()
+            self._raw_load.clear()
+            self._flt_load.clear()
             return
 
         self._raw_ch0.clear()
@@ -867,18 +874,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flt_ch1.clear()
         self._flt_iadc.clear()
         self._flt_batt.clear()
+        self._raw_load.clear()
+        self._flt_load.clear()
         self._reset_filter_state()
 
         if self._show_raw_values:
             src0 = list(self._hist_ch0_raw)
             src1 = list(self._hist_ch1_raw)
+            src_load = list(self._hist_load_raw)
         else:
             src0 = list(self._hist_ch0_cal)
             src1 = list(self._hist_ch1_cal)
+            src_load = list(self._hist_load_cal)
         yi = list(self._raw_iadc)
         yb = list(self._raw_batt)
 
-        n = min(len(src0), len(src1), len(yi), len(yb))
+        n = min(len(src0), len(src1), len(src_load), len(yi), len(yb))
         if n <= 0:
             return
 
@@ -886,30 +897,36 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(n):
             c0 = float(src0[i])
             c1 = float(src1[i])
+            cl = float(src_load[i])
             ci = float(yi[i])
             cb = float(yb[i])
             self._raw_ch0.append(c0)
             self._raw_ch1.append(c1)
+            self._raw_load.append(cl)
             if self._ema_ch0 is None:
                 self._ema_ch0 = c0
                 self._ema_ch1 = c1
                 self._ema_iadc = ci
                 self._ema_batt = cb
+                self._ema_load = cl
             else:
                 self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * c0
                 self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * c1
                 self._ema_iadc = (1.0 - a) * self._ema_iadc + a * ci
                 self._ema_batt = (1.0 - a) * self._ema_batt + a * cb
+                self._ema_load = (1.0 - a) * self._ema_load + a * cl
             self._flt_ch0.append(float(self._ema_ch0))
             self._flt_ch1.append(float(self._ema_ch1))
             self._flt_iadc.append(float(self._ema_iadc))
             self._flt_batt.append(float(self._ema_batt))
+            self._flt_load.append(float(self._ema_load))
 
     def _reset_filter_state(self) -> None:
         self._ema_ch0 = None
         self._ema_ch1 = None
         self._ema_iadc = None
         self._ema_batt = None
+        self._ema_load = None
 
     def _clear(self) -> None:
         self._xs.clear()
@@ -921,10 +938,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hist_ch1_raw.clear()
         self._hist_ch0_cal.clear()
         self._hist_ch1_cal.clear()
+        self._hist_load_raw.clear()
+        self._hist_load_cal.clear()
         self._flt_ch0.clear()
         self._flt_ch1.clear()
         self._flt_iadc.clear()
         self._flt_batt.clear()
+        self._raw_load.clear()
+        self._flt_load.clear()
 
         self._max_ch0 = self._max_ch1 = self._max_iadc = self._max_batt = None
         self._min_ch0 = self._min_ch1 = self._min_iadc = self._min_batt = None
@@ -945,6 +966,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._calib_pending_samples.clear()
         self.raw_stream_enabled.emit(False)
         self.calib_status_lbl.setText("Calib: reset")
+
+    @staticmethod
+    def _split_weight_thrust(value: float) -> tuple[float, float]:
+        signed = float(value)
+        weight = max(0.0, -signed)
+        thrust = max(0.0, signed)
+        return weight, thrust
 
     # -------------------------------------------------
     # Window view helpers (slice only; do NOT delete history)
@@ -974,6 +1002,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return xs[i0:], y0[i0:], y1[i0:], y2[i0:], y3[i0:]
 
+    def _get_active_load_series(self) -> tuple[list, list]:
+        xs = list(self._xs)
+        y = list(self._flt_load) if self._filter_enabled else list(self._raw_load)
+        if not xs:
+            return [], []
+        cutoff = xs[-1] - self._window_seconds
+        i0 = 0
+        for i, x in enumerate(xs):
+            if x >= cutoff:
+                i0 = i
+                break
+        return xs[i0:], y[i0:]
+
     def _recompute_window_maxes(self) -> None:
         xs, y0, y1, y2, y3 = self._get_active_series()
         if not xs:
@@ -996,18 +1037,18 @@ class MainWindow(QtWidgets.QMainWindow):
         ws = int(self._window_seconds)
         mode = "F" if self._filter_enabled else "R"
 
-        self.max_ch0_lbl.setText(f"Max 50kg ({ws}s) [{mode}]: {ff(self._max_ch0)}")
-        self.max_ch1_lbl.setText(f"Max 1000kg ({ws}s) [{mode}]: {ff(self._max_ch1)}")
+        self.max_ch0_lbl.setText(f"Max Weight ({ws}s) [{mode}]: {ff(self._max_ch0)}")
+        self.max_ch1_lbl.setText(f"Max Thrust ({ws}s) [{mode}]: {ff(self._max_ch1)}")
         self.max_iadc_lbl.setText(f"Max Tank Pressure ({ws}s) [{mode}]: {ff(self._max_iadc)}")
         self.max_batt_lbl.setText(f"Max BattV ({ws}s) [{mode}]: {ff(self._max_batt)}")
-        self.min_ch0_lbl.setText(f"Min 50kg ({ws}s) [{mode}]: {ff(self._min_ch0)}")
-        self.min_ch1_lbl.setText(f"Min 1000kg ({ws}s) [{mode}]: {ff(self._min_ch1)}")
+        self.min_ch0_lbl.setText(f"Min Weight ({ws}s) [{mode}]: {ff(self._min_ch0)}")
+        self.min_ch1_lbl.setText(f"Min Thrust ({ws}s) [{mode}]: {ff(self._min_ch1)}")
         self.min_iadc_lbl.setText(f"Min Tank Pressure ({ws}s) [{mode}]: {ff(self._min_iadc)}")
         self.min_batt_lbl.setText(f"Min BattV ({ws}s) [{mode}]: {ff(self._min_batt)}")
 
         if not self._xs:
-            self.cur_ch0_lbl.setText("Cur 50kg: —")
-            self.cur_ch1_lbl.setText("Cur 1000kg: —")
+            self.cur_ch0_lbl.setText("Cur Weight: —")
+            self.cur_ch1_lbl.setText("Cur Thrust: —")
             self.cur_iadc_lbl.setText("Cur Tank Pressure: —")
             self.cur_batt_lbl.setText("Cur BattV: —")
             return
@@ -1023,23 +1064,43 @@ class MainWindow(QtWidgets.QMainWindow):
             ci = self._raw_iadc[-1] if self._raw_iadc else None
             cb = self._raw_batt[-1] if self._raw_batt else None
 
-        self.cur_ch0_lbl.setText(f"Cur 50kg [{mode}]: {ff(c0)}")
-        self.cur_ch1_lbl.setText(f"Cur 1000kg [{mode}]: {ff(c1)}")
+        self.cur_ch0_lbl.setText(f"Cur Weight [{mode}]: {ff(c0)}")
+        self.cur_ch1_lbl.setText(f"Cur Thrust [{mode}]: {ff(c1)}")
         self.cur_iadc_lbl.setText(f"Cur Tank Pressure [{mode}]: {ff(ci)}")
         self.cur_batt_lbl.setText(f"Cur BattV [{mode}]: {ff(cb)}")
 
     def _redraw(self) -> None:
         xs, y0, y1, y2, y3 = self._get_active_series()
+        load_xs, load_y = self._get_active_load_series()
 
-        self.c0.setData(xs, y0)
-        self.c1.setData(xs, y1)
+        if load_xs and load_y:
+            thrust_max = max((v for v in load_y if v > 0.0), default=0.0)
+            weight_max = max((-v for v in load_y if v < 0.0), default=0.0)
+            thrust_den = thrust_max if thrust_max > 1e-9 else 1.0
+            weight_den = weight_max if weight_max > 1e-9 else 1.0
+            y_norm = [(v / thrust_den) if v >= 0.0 else (v / weight_den) for v in load_y]
+            self.c0.setData(load_xs, y_norm)
+            self.c1.setData([], [])
+            self.p_load.setYRange(-1.0, 1.0, padding=0.02)
+            wtick = weight_max if weight_max > 0.0 else 1.0
+            ttick = thrust_max if thrust_max > 0.0 else 1.0
+            self.p_load.getAxis("left").setTicks([[
+                (-1.0, f"{wtick:.1f}"),
+                (-0.5, f"{0.5 * wtick:.1f}"),
+                (0.0, "0"),
+                (0.5, f"{0.5 * ttick:.1f}"),
+                (1.0, f"{ttick:.1f}"),
+            ]])
+        else:
+            self.c0.setData([], [])
+            self.c1.setData([], [])
         self.c2.setData(xs, y2)
         self.c3.setData(xs, y3)
 
         if xs:
             xmin = xs[-1] - self._window_seconds
             xmax = xs[-1]
-            for p in (self.p0, self.p1, self.p2, self.p3):
+            for p in (self.p_load, self.p2, self.p3):
                 p.setXRange(xmin, xmax, padding=0)
 
     @QtCore.pyqtSlot(float, float)
@@ -1097,14 +1158,20 @@ class MainWindow(QtWidgets.QMainWindow):
         t_seconds = t_mono - self._stream_t0_mono
 
         self._xs.append(float(t_seconds))
-        self._hist_ch0_raw.append(float(ch0_raw))
-        self._hist_ch1_raw.append(float(ch1_raw))
-        self._hist_ch0_cal.append(float(ch0_cal))
-        self._hist_ch1_cal.append(float(ch1_cal))
-        ch0 = float(ch0_raw) if self._show_raw_values else float(ch0_cal)
-        ch1 = float(ch1_raw) if self._show_raw_values else float(ch1_cal)
+        weight_raw, thrust_raw = self._split_weight_thrust(ch1_raw)
+        weight_cal, thrust_cal = self._split_weight_thrust(ch1_cal)
+        self._hist_ch0_raw.append(weight_raw)
+        self._hist_ch1_raw.append(thrust_raw)
+        self._hist_ch0_cal.append(weight_cal)
+        self._hist_ch1_cal.append(thrust_cal)
+        self._hist_load_raw.append(float(ch1_raw))
+        self._hist_load_cal.append(float(ch1_cal))
+        ch0 = weight_raw if self._show_raw_values else weight_cal
+        ch1 = thrust_raw if self._show_raw_values else thrust_cal
+        load = float(ch1_raw) if self._show_raw_values else float(ch1_cal)
         self._raw_ch0.append(ch0)
         self._raw_ch1.append(ch1)
+        self._raw_load.append(load)
         self._raw_iadc.append(float(internal_adc))
         self._raw_batt.append(float(battery_voltage))
 
@@ -1114,16 +1181,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ema_ch1 = float(ch1)
             self._ema_iadc = float(internal_adc)
             self._ema_batt = float(battery_voltage)
+            self._ema_load = float(load)
         else:
             self._ema_ch0 = (1.0 - a) * self._ema_ch0 + a * float(ch0)
             self._ema_ch1 = (1.0 - a) * self._ema_ch1 + a * float(ch1)
             self._ema_iadc = (1.0 - a) * self._ema_iadc + a * float(internal_adc)
             self._ema_batt = (1.0 - a) * self._ema_batt + a * float(battery_voltage)
+            self._ema_load = (1.0 - a) * self._ema_load + a * float(load)
 
         self._flt_ch0.append(float(self._ema_ch0))
         self._flt_ch1.append(float(self._ema_ch1))
         self._flt_iadc.append(float(self._ema_iadc))
         self._flt_batt.append(float(self._ema_batt))
+        self._flt_load.append(float(self._ema_load))
 
     def _consume_latest_sample(self) -> None:
         if self._paused:
@@ -1360,12 +1430,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _save_calibration(self) -> None:
-        points0 = list(self._calib_points_ch0)
+        points0 = []
         points1 = list(self._calib_points_ch1)
-        has_ch0 = len(points0) >= 3
+        has_ch0 = False
         has_ch1 = len(points1) >= 3
-        if not has_ch0 and not has_ch1:
-            self.calib_status_lbl.setText("Calib: capture at least 3 points for Ch0 or Ch1")
+        if not has_ch1:
+            self.calib_status_lbl.setText("Calib: capture at least 3 points for Ch1")
             return
 
         def fit_line(xs: list[float], ys: list[float]) -> tuple[float, float]:
@@ -1568,16 +1638,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         out["version"] = 1
 
-        if has_ch0:
-            out["ch0"] = {"m": ch0_m, "b": ch0_b}
-            out["points"] = [{"kg": p.weight, "ch0_raw": p.ch0_raw} for p in points0]
-            if ch0_x0 is not None:
-                out["ch0_zero_raw"] = ch0_x0
-            if ch0_poly2 is not None and ch0_fit_type == "poly2":
-                a, b, c = ch0_poly2
-                out["ch0_fit"] = {"type": "poly2", "a": a, "b": b, "c": c, "x0": ch0_x0}
-            else:
-                out["ch0_fit"] = {"type": "linear", "x0": ch0_x0}
+        # Purge legacy 50kg calibration keys from output.
+        out.pop("ch0", None)
+        out.pop("points", None)
+        out.pop("ch0_zero_raw", None)
+        out.pop("ch0_fit", None)
         if has_ch1:
             out["ch1"] = {"m": ch1_m, "b": ch1_b}
             out["points_ch1"] = [{"kg": p.weight, "ch1_raw": p.ch1_raw} for p in points1]
@@ -1590,8 +1655,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 out["ch1_fit"] = {"type": "linear", "x0": ch1_x0}
 
         all_weights = []
-        if has_ch0:
-            all_weights.extend([p.weight for p in points0])
         if has_ch1:
             all_weights.extend([p.weight for p in points1])
         out["weights_kg"] = sorted({w for w in all_weights})

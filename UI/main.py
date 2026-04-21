@@ -42,10 +42,6 @@ class BufferedRow:
 
 @dataclass(frozen=True)
 class Calibration:
-    ch0_m: Optional[float]
-    ch0_b: Optional[float]
-    ch0_zero_raw: Optional[float]
-    ch0_poly2: Optional[tuple[float, float, float]]
     ch1_m: Optional[float]
     ch1_b: Optional[float]
     ch1_poly2: Optional[tuple[float, float, float]]
@@ -60,21 +56,9 @@ def load_calibration(path: Path) -> Optional[Calibration]:
         return None
     try:
         data = json.loads(path.read_text())
-        ch0 = data.get("ch0")
         ch1 = data.get("ch1")
         iadc = data.get("iadc")
-        ch0_fit = data.get("ch0_fit", {})
         ch1_fit = data.get("ch1_fit", {})
-        ch0_poly2 = None
-        if isinstance(ch0_fit, dict) and ch0_fit.get("type") == "poly2":
-            try:
-                ch0_poly2 = (
-                    float(ch0_fit["a"]),
-                    float(ch0_fit["b"]),
-                    float(ch0_fit["c"]),
-                )
-            except Exception:
-                ch0_poly2 = None
         ch1_poly2 = None
         if isinstance(ch1_fit, dict) and ch1_fit.get("type") == "poly2":
             try:
@@ -87,10 +71,6 @@ def load_calibration(path: Path) -> Optional[Calibration]:
                 ch1_poly2 = None
 
         return Calibration(
-            ch0_m=float(ch0["m"]) if ch0 and "m" in ch0 else None,
-            ch0_b=float(ch0["b"]) if ch0 and "b" in ch0 else None,
-            ch0_zero_raw=float(data.get("ch0_zero_raw")) if data.get("ch0_zero_raw") is not None else None,
-            ch0_poly2=ch0_poly2,
             ch1_m=float(ch1["m"]) if ch1 and "m" in ch1 else None,
             ch1_b=float(ch1["b"]) if ch1 and "b" in ch1 else None,
             ch1_poly2=ch1_poly2,
@@ -435,12 +415,10 @@ class RadioWorker(QtCore.QThread):
                 "Header",
                 "Seq",
                 "Timestamp",
-                "50kg Raw",
                 "1000kg Raw",
                 "Tank Pressure Raw",
                 "Battery Voltage",
                 "CRC",
-                "50kg Calibrated",
                 "1000kg Calibrated",
                 "Tank Pressure Calibrated",
             ])
@@ -503,10 +481,9 @@ class RadioWorker(QtCore.QThread):
         if self._calibration is None:
             return
 
-        ch0 = self._format_calib_value(self._calibration.ch0_m, self._calibration.ch0_b)
         ch1 = self._format_calib_value(self._calibration.ch1_m, self._calibration.ch1_b)
         iadc = self._format_calib_value(self._calibration.iadc_m, self._calibration.iadc_b)
-        if not ch0 and not ch1 and not iadc:
+        if not ch1 and not iadc:
             return
 
         row = [
@@ -514,10 +491,8 @@ class RadioWorker(QtCore.QThread):
             "",
             "",
             "",
-            ch0,
             ch1,
             iadc,
-            "",
             "",
             "",
             "",
@@ -529,26 +504,12 @@ class RadioWorker(QtCore.QThread):
         except Exception:
             pass
 
-    def _calibrate_channels(self, ch0_raw: float, ch1_raw: float) -> tuple[float, float]:
+    def _calibrate_channels(self, _ch0_raw: float, ch1_raw: float) -> tuple[float, float]:
+        # Ch0 (legacy 50kg) is ignored by design. Keep API shape for GUI compatibility.
+        ch0_kg = 0.0
         if self._calibration is None:
-            ch0_kg = (5.0 / 12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0 / 6.0)
             ch1_kg = (10.0 * ((ch1_raw / 2.929497e-06) - (10 - 1.8) + 3.8)) - 14
             return float(ch0_kg), float(ch1_kg)
-
-        if self._calibration.ch0_poly2 is not None:
-            a, b, c = self._calibration.ch0_poly2
-            if self._calibration.ch0_zero_raw is not None:
-                x = ch0_raw - self._calibration.ch0_zero_raw
-                ch0_kg = (a * x * x) + (b * x) + c
-            else:
-                ch0_kg = (a * ch0_raw * ch0_raw) + (b * ch0_raw) + c
-        elif self._calibration.ch0_m is not None and self._calibration.ch0_b is not None:
-            if self._calibration.ch0_zero_raw is not None:
-                ch0_kg = self._calibration.ch0_m * (ch0_raw - self._calibration.ch0_zero_raw)
-            else:
-                ch0_kg = self._calibration.ch0_m * ch0_raw + self._calibration.ch0_b
-        else:
-            ch0_kg = (5.0 / 12.0) * ((ch0_raw / 5.831609e-05) - 9.2) + (5.0 / 6.0)
 
         if self._calibration.ch1_poly2 is not None:
             a, b, c = self._calibration.ch1_poly2
@@ -720,24 +681,31 @@ class RadioWorker(QtCore.QThread):
                         packet_t_mono = nxt_t_mono
 
                 t_mono = packet_t_mono
-                ch0_raw = float(packet.channel0)
                 ch1_raw = float(packet.channel1)
 
                 # CSV work is expensive; skip it unless a save session has been started.
                 if self._logging_enabled or self._csv_path is not None:
                     rx_timestamp = datetime.now().isoformat(timespec="milliseconds")
                     try:
-                        # expects packet.to_csv_row(rx_timestamp) returns:
-                        # [rx_timestamp, header, seq, timestamp, ch0, ch1, internal_adc, battery_voltage, crc]
-                        row = packet.to_csv_row(rx_timestamp)
-                        ch0_kg_csv, ch1_kg_csv = self._calibrate_channels(ch0_raw, ch1_raw)
+                        _, ch1_kg_csv = self._calibrate_channels(0.0, ch1_raw)
                         tank_p_csv = self._calibrate_tank_pressure(float(packet.internal_adc))
-                        row.extend([ch0_kg_csv, ch1_kg_csv, tank_p_csv])
+                        row = [
+                            rx_timestamp,
+                            int(packet.header),
+                            int(packet.sequence),
+                            int(packet.timestamp),
+                            float(packet.channel1),
+                            int(packet.internal_adc),
+                            float(packet.battery_voltage),
+                            int(packet.crc),
+                            ch1_kg_csv,
+                            tank_p_csv,
+                        ]
                         key = CsvKey(
-                            header=int(row[1]),
-                            seq=int(row[2]),
-                            timestamp=int(row[3]),
-                            crc=int(row[8]),
+                            header=int(packet.header),
+                            seq=int(packet.sequence),
+                            timestamp=int(packet.timestamp),
+                            crc=int(packet.crc),
                         )
                     except Exception as e:
                         self.status.emit(f"Packet->CSV error: {e}")
@@ -762,22 +730,21 @@ class RadioWorker(QtCore.QThread):
                     if latest_ui is not None and (not isinstance(latest_ui[0], tuple)):
                         ui_packet, ui_t_mono = latest_ui
 
-                    ch0_raw_ui = float(ui_packet.channel0)
                     ch1_raw_ui = float(ui_packet.channel1)
 
                     if self._raw_stream_enabled and (ui_t_mono - last_raw_emit) >= raw_emit_period:
-                        self.raw_sample.emit(float(ui_t_mono), ch0_raw_ui, ch1_raw_ui, float(ui_packet.internal_adc))
+                        self.raw_sample.emit(float(ui_t_mono), 0.0, ch1_raw_ui, float(ui_packet.internal_adc))
                         last_raw_emit = ui_t_mono
 
                     if (ui_t_mono - last_ui_emit) >= ui_emit_period:
-                        ch0_cal, ch1_cal = self._calibrate_channels(ch0_raw_ui, ch1_raw_ui)
+                        _, ch1_cal = self._calibrate_channels(0.0, ch1_raw_ui)
                         tank_pressure = self._calibrate_tank_pressure(float(ui_packet.internal_adc))
                         batt_v = float(ui_packet.battery_voltage)
                         self.sample.emit(
                             float(ui_t_mono),
-                            float(ch0_raw_ui),
+                            0.0,
                             float(ch1_raw_ui),
-                            float(ch0_cal),
+                            0.0,
                             float(ch1_cal),
                             float(tank_pressure),
                             batt_v,

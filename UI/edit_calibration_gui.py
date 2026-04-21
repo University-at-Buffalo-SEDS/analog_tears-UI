@@ -41,7 +41,7 @@ class _PointValueDialog(QtWidgets.QDialog):
         layout.addLayout(form)
 
         self.weight_spin = QtWidgets.QDoubleSpinBox()
-        self.weight_spin.setRange(0.0, 10000.0)
+        self.weight_spin.setRange(-10000.0, 10000.0)
         self.weight_spin.setDecimals(3)
         self.weight_spin.setSingleStep(0.1)
         self.weight_spin.setValue(float(weight))
@@ -84,7 +84,7 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
         layout.addLayout(top)
         top.addWidget(QtWidgets.QLabel("Channel:"))
         self.channel_combo = QtWidgets.QComboBox()
-        self.channel_combo.addItems(["50kg", "1000kg", "Tank Pressure"])
+        self.channel_combo.addItems(["1000kg", "Tank Pressure"])
         self.channel_combo.currentIndexChanged.connect(self._reload_list)
         top.addWidget(self.channel_combo)
         self.sequence_lbl = QtWidgets.QLabel("Sequence: —")
@@ -132,10 +132,11 @@ class _PointsSequenceDialog(QtWidgets.QDialog):
         self._reload_list()
 
     def _channel(self) -> int:
-        return int(self.channel_combo.currentIndex())
+        idx = int(self.channel_combo.currentIndex())
+        return 1 if idx == 0 else 2
 
     def _channel_name(self, ch: int) -> str:
-        return "50kg" if ch == 0 else ("1000kg" if ch == 1 else "Tank Pressure")
+        return "1000kg" if ch == 1 else "Tank Pressure"
 
     def _reload_list(self) -> None:
         ch = self._channel()
@@ -249,7 +250,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._capture_target = 200
         self._capture_vals: list[float] = []
         self._capture_mode = "manual"
-        self._sequence_started: dict[int, bool] = {0: False, 1: False, 2: False}
+        self._sequence_started: dict[int, bool] = {1: False, 2: False}
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -272,7 +273,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         grid.addWidget(QtWidgets.QLabel("Slope (m)"), 0, 1)
         grid.addWidget(QtWidgets.QLabel("Intercept (b)"), 0, 2)
 
-        grid.addWidget(QtWidgets.QLabel("50kg"), 1, 0)
+        grid.addWidget(QtWidgets.QLabel("Weight"), 1, 0)
         self.ch0_m = QtWidgets.QLineEdit()
         self.ch0_b = QtWidgets.QLineEdit()
         grid.addWidget(self.ch0_m, 1, 1)
@@ -292,7 +293,7 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         zero_row = QtWidgets.QHBoxLayout()
         layout.addLayout(zero_row)
-        zero_row.addWidget(QtWidgets.QLabel("Zero raw 50kg:"))
+        zero_row.addWidget(QtWidgets.QLabel("Zero raw Weight:"))
         self.ch0_zero = QtWidgets.QLineEdit()
         self.ch0_zero.setFixedWidth(160)
         zero_row.addWidget(self.ch0_zero)
@@ -316,7 +317,7 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         points_row = QtWidgets.QHBoxLayout()
         layout.addLayout(points_row)
-        self.points_ch0_lbl = QtWidgets.QLabel("50kg points: —")
+        self.points_ch0_lbl = QtWidgets.QLabel("Weight points: —")
         self.points_ch1_lbl = QtWidgets.QLabel("1000kg points: —")
         self.points_iadc_lbl = QtWidgets.QLabel("Tank pressure points: —")
         points_row.addWidget(self.points_ch0_lbl)
@@ -326,7 +327,7 @@ class CalibrationEditor(QtWidgets.QWidget):
 
         fit_row = QtWidgets.QHBoxLayout()
         layout.addLayout(fit_row)
-        self.ch0_fit_lbl = QtWidgets.QLabel("50kg fit: —")
+        self.ch0_fit_lbl = QtWidgets.QLabel("Weight fit: —")
         fit_row.addWidget(self.ch0_fit_lbl)
         self.ch1_fit_lbl = QtWidgets.QLabel("1000kg fit: —")
         fit_row.addWidget(self.ch1_fit_lbl)
@@ -342,7 +343,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.refit_btn = QtWidgets.QPushButton("Refit from points")
         self.refit_btn.clicked.connect(self._refit_from_points)
         ops_row.addWidget(self.refit_btn)
-        self.seq_state_lbl = QtWidgets.QLabel("Sequence: 50kg not started, 1000kg not started, TankP not started")
+        self.seq_state_lbl = QtWidgets.QLabel("Sequence: 1000kg not started, TankP not started")
         ops_row.addWidget(self.seq_state_lbl)
         ops_row.addStretch(1)
 
@@ -351,7 +352,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.plot_widget = pg.GraphicsLayoutWidget()
         plots_row.addWidget(self.plot_widget, stretch=1)
 
-        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="50kg Calibration")
+        self.p0 = self.plot_widget.addPlot(row=0, col=0, title="Weight Calibration")
         self.p1 = self.plot_widget.addPlot(row=0, col=1, title="1000kg Calibration")
         self.p2 = self.plot_widget.addPlot(row=0, col=2, title="Tank Pressure Calibration")
         for p in (self.p0, self.p1, self.p2):
@@ -428,55 +429,39 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._data = data
         self._path = path
 
-        ch0 = data.get("ch0", {})
         ch1 = data.get("ch1", {})
 
-        self.ch0_m.setText("" if "m" not in ch0 or ch0["m"] is None else str(ch0["m"]))
-        self.ch0_b.setText("" if "b" not in ch0 or ch0["b"] is None else str(ch0["b"]))
+        self.ch0_m.setText("")
+        self.ch0_b.setText("")
         self.ch1_m.setText("" if "m" not in ch1 or ch1["m"] is None else str(ch1["m"]))
         self.ch1_b.setText("" if "b" not in ch1 or ch1["b"] is None else str(ch1["b"]))
         iadc = data.get("iadc", {})
         self.iadc_m.setText("" if "m" not in iadc or iadc["m"] is None else str(iadc["m"]))
         self.iadc_b.setText("" if "b" not in iadc or iadc["b"] is None else str(iadc["b"]))
 
-        self.ch0_zero.setText("" if data.get("ch0_zero_raw") is None else str(data.get("ch0_zero_raw")))
+        self.ch0_zero.setText("")
         self.ch1_zero.setText("" if data.get("ch1_zero_raw") is None else str(data.get("ch1_zero_raw")))
         self.iadc_zero.setText("" if data.get("iadc_zero_raw") is None else str(data.get("iadc_zero_raw")))
-        self._sequence_started[0] = data.get("ch0_zero_raw") is not None
         self._sequence_started[1] = data.get("ch1_zero_raw") is not None
         self._sequence_started[2] = data.get("iadc_zero_raw") is not None
         self._update_sequence_status_label()
 
-        pts0 = data.get("points", [])
         pts1 = data.get("points_ch1", [])
         pts2 = data.get("points_iadc", [])
         ch1_fit = data.get("ch1_fit", {})
-        ch0_fit = data.get("ch0_fit", {})
         iadc_fit = data.get("iadc_fit", {})
-        ch0_m = _get_float(self.ch0_m.text())
-        ch0_b = _get_float(self.ch0_b.text())
         ch1_m = _get_float(self.ch1_m.text())
         ch1_b = _get_float(self.ch1_b.text())
         iadc_m = _get_float(self.iadc_m.text())
         iadc_b = _get_float(self.iadc_b.text())
-        self._ch0_fit_meta = ch0_fit if isinstance(ch0_fit, dict) else None
+        self._ch0_fit_meta = None
         self._ch1_fit_meta = ch1_fit if isinstance(ch1_fit, dict) else None
         self._iadc_fit_meta = iadc_fit if isinstance(iadc_fit, dict) else None
-        if self._ch0_fit_meta is None and ch0_m is not None and ch0_b is not None:
-            self._ch0_fit_meta = {"type": "linear", "x0": _get_float(self.ch0_zero.text())}
         if self._ch1_fit_meta is None and ch1_m is not None and ch1_b is not None:
             self._ch1_fit_meta = {"type": "linear", "x0": _get_float(self.ch1_zero.text())}
         if self._iadc_fit_meta is None and iadc_m is not None and iadc_b is not None:
             self._iadc_fit_meta = {"type": "linear", "x0": _get_float(self.iadc_zero.text())}
-        if isinstance(ch0_fit, dict) and ch0_fit.get("type") == "poly2":
-            a = ch0_fit.get("a")
-            b = ch0_fit.get("b")
-            c = ch0_fit.get("c")
-            self.ch0_fit_lbl.setText(f"50kg fit: poly2 (a={a}, b={b}, c={c})")
-        elif isinstance(ch0_fit, dict) and ch0_fit.get("type") == "linear":
-            self.ch0_fit_lbl.setText("50kg fit: linear")
-        else:
-            self.ch0_fit_lbl.setText("50kg fit: —")
+        self.ch0_fit_lbl.setText("Weight fit: removed")
         if isinstance(ch1_fit, dict) and ch1_fit.get("type") == "poly2":
             a = ch1_fit.get("a")
             b = ch1_fit.get("b")
@@ -501,16 +486,6 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._points0_xy = []
         self._points1_xy = []
         self._points2_xy = []
-        if isinstance(pts0, list) and pts0:
-            for p in pts0:
-                try:
-                    raw = p.get("ch0_raw")
-                    kg = p.get("kg")
-                    if raw is not None and kg is not None:
-                        self._points0_xy.append((float(raw), float(kg)))
-                except Exception:
-                    pass
-
         if isinstance(pts1, list) and pts1:
             for p in pts1:
                 try:
@@ -537,7 +512,7 @@ class CalibrationEditor(QtWidgets.QWidget):
         self.status_lbl.setText(f"Status: loaded {path}")
 
     def _refresh_points_lists(self) -> None:
-        self.points_ch0_lbl.setText(f"50kg points: {len(self._points0_xy)}")
+        self.points_ch0_lbl.setText("Weight points: removed")
         self.points_ch1_lbl.setText(f"1000kg points: {len(self._points1_xy)}")
         self.points_iadc_lbl.setText(f"Tank pressure points: {len(self._points2_xy)}")
         all_w = sorted({kg for _, kg in self._points0_xy} | {kg for _, kg in self._points1_xy} | {v for _, v in self._points2_xy})
@@ -546,10 +521,9 @@ class CalibrationEditor(QtWidgets.QWidget):
         self._update_regression_plots()
 
     def _update_sequence_status_label(self) -> None:
-        ch0 = "started" if self._sequence_started.get(0, False) else "not started"
         ch1 = "started" if self._sequence_started.get(1, False) else "not started"
         ch2 = "started" if self._sequence_started.get(2, False) else "not started"
-        self.seq_state_lbl.setText(f"Sequence: 50kg {ch0}, 1000kg {ch1}, TankP {ch2}")
+        self.seq_state_lbl.setText(f"Sequence: 1000kg {ch1}, TankP {ch2}")
 
     def _open_points_modal(self) -> None:
         dlg = _PointsSequenceDialog(self)
@@ -565,7 +539,7 @@ class CalibrationEditor(QtWidgets.QWidget):
 
     def _channel_name(self, channel: int) -> str:
         ch = int(channel)
-        return "50kg" if ch == 0 else ("1000kg" if ch == 1 else "Tank Pressure")
+        return "1000kg" if ch == 1 else "Tank Pressure"
 
     def _upsert_point(self, channel: int, kg: float, raw: float) -> str:
         pts = self._points_for_channel(channel)
@@ -643,8 +617,8 @@ class CalibrationEditor(QtWidgets.QWidget):
         if not self._sequence_started.get(ch, False):
             self.status_lbl.setText(f"Status: start {self._channel_name(ch)} sequence first (0)")
             return False
-        if float(kg) <= 0.0:
-            self.status_lbl.setText("Status: expected kg must be > 0 for sequence points")
+        if abs(float(kg)) <= 1e-9:
+            self.status_lbl.setText("Status: expected kg must be non-zero for sequence points")
             return False
         self._begin_capture(ch, float(kg), "sequence_point")
         return True
@@ -707,7 +681,7 @@ class CalibrationEditor(QtWidgets.QWidget):
                     )
         if received and not self._capture_active:
             self.live_lbl.setText(
-                f"Live raw: 50kg={self._live_raw_ch0:.6g}  1000kg={self._live_raw_ch1:.6g}  TankP={self._live_raw_iadc:.6g}"
+                f"Live raw: 1000kg={self._live_raw_ch1:.6g}  TankP={self._live_raw_iadc:.6g}"
             )
 
     def _refit_from_points(self) -> None:
@@ -821,13 +795,6 @@ class CalibrationEditor(QtWidgets.QWidget):
             return m, b, None, {"type": "linear", "x0": None}
 
         try:
-            if len(self._points0_xy) >= 3:
-                m0, b0, x0, fit0 = fit_one(self._points0_xy)
-                self.ch0_m.setText(str(m0))
-                self.ch0_b.setText(str(b0))
-                self.ch0_zero.setText("" if x0 is None else str(x0))
-                self._ch0_fit_meta = fit0
-                self.ch0_fit_lbl.setText(f"50kg fit: {fit0.get('type', 'linear')}")
             if len(self._points1_xy) >= 3:
                 m1, b1, x1, fit1 = fit_one(self._points1_xy)
                 self.ch1_m.setText(str(m1))
@@ -893,7 +860,8 @@ class CalibrationEditor(QtWidgets.QWidget):
             y_fit = [(m * x) + b for x in x_fit]
             fit_curve.setData(x_fit, y_fit)
 
-        set_channel(self._points0_xy, self.ch0_m, self.ch0_b, self.p0_points, self.p0_fit)
+        self.p0_points.setData([], [])
+        self.p0_fit.setData([], [])
         set_channel(self._points1_xy, self.ch1_m, self.ch1_b, self.p1_points, self.p1_fit)
         set_channel(self._points2_xy, self.iadc_m, self.iadc_b, self.p2_points, self.p2_fit)
 
@@ -903,43 +871,36 @@ class CalibrationEditor(QtWidgets.QWidget):
             return
 
         try:
-            ch0_m = _get_float(self.ch0_m.text())
-            ch0_b = _get_float(self.ch0_b.text())
             ch1_m = _get_float(self.ch1_m.text())
             ch1_b = _get_float(self.ch1_b.text())
             iadc_m = _get_float(self.iadc_m.text())
             iadc_b = _get_float(self.iadc_b.text())
             iadc_zero = _get_float(self.iadc_zero.text())
-            ch0_zero = _get_float(self.ch0_zero.text())
             ch1_zero = _get_float(self.ch1_zero.text())
         except Exception as e:
             self.status_lbl.setText(f"Status: invalid number ({e})")
             return
 
-        self._data.setdefault("ch0", {})
         self._data.setdefault("ch1", {})
-        self._data["ch0"]["m"] = ch0_m
-        self._data["ch0"]["b"] = ch0_b
         self._data["ch1"]["m"] = ch1_m
         self._data["ch1"]["b"] = ch1_b
         self._data.setdefault("iadc", {})
         self._data["iadc"]["m"] = iadc_m
         self._data["iadc"]["b"] = iadc_b
         self._data["iadc_zero_raw"] = iadc_zero
-        self._data["ch0_zero_raw"] = ch0_zero
         self._data["ch1_zero_raw"] = ch1_zero
-        self._data["points"] = [{"kg": kg, "ch0_raw": raw} for raw, kg in self._points0_xy]
         self._data["points_ch1"] = [{"kg": kg, "ch1_raw": raw} for raw, kg in self._points1_xy]
         self._data["points_iadc"] = [{"expected": v, "iadc_raw": raw} for raw, v in self._points2_xy]
-        self._data["weights_kg"] = sorted(
-            {kg for _, kg in self._points0_xy} | {kg for _, kg in self._points1_xy} | {v for _, v in self._points2_xy}
-        )
-        if isinstance(self._ch0_fit_meta, dict):
-            self._data["ch0_fit"] = self._ch0_fit_meta
+        self._data["weights_kg"] = sorted({kg for _, kg in self._points1_xy} | {v for _, v in self._points2_xy})
         if isinstance(self._ch1_fit_meta, dict):
             self._data["ch1_fit"] = self._ch1_fit_meta
         if isinstance(self._iadc_fit_meta, dict):
             self._data["iadc_fit"] = self._iadc_fit_meta
+        # Remove legacy 50kg calibration keys.
+        self._data.pop("ch0", None)
+        self._data.pop("ch0_zero_raw", None)
+        self._data.pop("points", None)
+        self._data.pop("ch0_fit", None)
 
         try:
             if self.backup_chk.isChecked():
