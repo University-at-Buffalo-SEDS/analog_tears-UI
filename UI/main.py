@@ -420,6 +420,8 @@ class RadioWorker(QtCore.QThread):
                 "Battery Voltage",
                 "CRC",
                 "1000kg Calibrated",
+                "Weight",
+                "Thrust",
                 "Tank Pressure Calibrated",
             ])
             self._write_calibration_row()
@@ -497,6 +499,8 @@ class RadioWorker(QtCore.QThread):
             "",
             "",
             "",
+            "",
+            "",
         ]
         self._csv_writer.writerow(row)
         try:
@@ -534,6 +538,13 @@ class RadioWorker(QtCore.QThread):
                 return float(self._calibration.iadc_m * (iadc_raw - self._calibration.iadc_zero_raw))
             return float(self._calibration.iadc_m * iadc_raw + self._calibration.iadc_b)
         return float(iadc_raw / 1.78)
+
+    @staticmethod
+    def _split_weight_thrust(value: float) -> tuple[float, float]:
+        signed = float(value)
+        weight = max(0.0, -signed)
+        thrust = max(0.0, signed)
+        return weight, thrust
 
     # ----------------------------
     # Main worker loop
@@ -688,6 +699,7 @@ class RadioWorker(QtCore.QThread):
                     rx_timestamp = datetime.now().isoformat(timespec="milliseconds")
                     try:
                         _, ch1_kg_csv = self._calibrate_channels(0.0, ch1_raw)
+                        weight_csv, thrust_csv = self._split_weight_thrust(ch1_kg_csv)
                         tank_p_csv = self._calibrate_tank_pressure(float(packet.internal_adc))
                         row = [
                             rx_timestamp,
@@ -699,6 +711,8 @@ class RadioWorker(QtCore.QThread):
                             float(packet.battery_voltage),
                             int(packet.crc),
                             ch1_kg_csv,
+                            weight_csv,
+                            thrust_csv,
                             tank_p_csv,
                         ]
                         key = CsvKey(
