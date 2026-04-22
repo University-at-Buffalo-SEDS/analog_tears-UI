@@ -311,6 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prev_real_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
         self._show_raw_values = False
         self._active_calib_dialog: Optional[_CalibrationDialog] = None
+        self._load_plot_min_half_span = 25.0
 
         # Filter settings
         self._default_filter_enabled = False
@@ -1072,25 +1073,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _redraw(self) -> None:
         xs, y0, y1, y2, y3 = self._get_active_series()
         load_xs, load_y = self._get_active_load_series()
+        load_peak = max((abs(v) for v in load_y), default=0.0)
+        load_full = max(float(self._load_plot_min_half_span), float(load_peak), 1.0)
+        self.p_load.setYRange(-load_full, load_full, padding=0.02)
+        self.p_load.getAxis("left").setTicks([[
+            (-load_full, f"{-load_full:.1f}"),
+            (-0.5 * load_full, f"{-0.5 * load_full:.1f}"),
+            (0.0, "0"),
+            (0.5 * load_full, f"{0.5 * load_full:.1f}"),
+            (load_full, f"{load_full:.1f}"),
+        ]])
 
         if load_xs and load_y:
-            thrust_max = max((v for v in load_y if v > 0.0), default=0.0)
-            weight_max = max((-v for v in load_y if v < 0.0), default=0.0)
-            thrust_den = thrust_max if thrust_max > 1e-9 else 1.0
-            weight_den = weight_max if weight_max > 1e-9 else 1.0
-            y_norm = [(v / thrust_den) if v >= 0.0 else (v / weight_den) for v in load_y]
-            self.c0.setData(load_xs, y_norm)
+            self.c0.setData(load_xs, load_y)
             self.c1.setData([], [])
-            self.p_load.setYRange(-1.0, 1.0, padding=0.02)
-            wtick = weight_max if weight_max > 0.0 else 1.0
-            ttick = thrust_max if thrust_max > 0.0 else 1.0
-            self.p_load.getAxis("left").setTicks([[
-                (-1.0, f"{wtick:.1f}"),
-                (-0.5, f"{0.5 * wtick:.1f}"),
-                (0.0, "0"),
-                (0.5, f"{0.5 * ttick:.1f}"),
-                (1.0, f"{ttick:.1f}"),
-            ]])
         else:
             self.c0.setData([], [])
             self.c1.setData([], [])

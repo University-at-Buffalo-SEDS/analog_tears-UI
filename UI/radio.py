@@ -48,6 +48,7 @@ class Radio:
 
         # Status print throttle (optional)
         self._last_err_print = 0.0
+        self._disconnect_logged = False
         self._verify_crc = True
 
         if not self.simulate:
@@ -166,7 +167,7 @@ class Radio:
         self._verify_crc = bool(enabled)
 
     def _mark_disconnected(self, reason: str | None = None) -> None:
-        if reason:
+        if reason and (not self._disconnect_logged):
             self._print_err_throttled(f"[Radio] Disconnected: {reason}")
         try:
             if self.ser and self.ser.is_open:
@@ -175,6 +176,7 @@ class Radio:
             pass
         self.ser = None
         self._rx_buf.clear()
+        self._disconnect_logged = True
 
     def reconnect(self, *, timeout: float = 0.05) -> bool:
         """Try to reopen the serial port. Returns True on success."""
@@ -184,6 +186,7 @@ class Radio:
             return True
         try:
             self._open_serial(timeout=timeout)
+            self._disconnect_logged = False
             return True
         except Exception as e:
             self._mark_disconnected(str(e))
