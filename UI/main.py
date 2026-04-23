@@ -165,7 +165,7 @@ class RadioWorker(QtCore.QThread):
     # ----------------------------
     @QtCore.pyqtSlot(str)
     def start_logging(self, filename: str) -> None:
-        path = Path(filename)
+        path = self._next_non_overwriting_csv_path(Path(filename))
         self._csv_path = path
         self._open_csv_if_needed()
         self._logging_enabled = True
@@ -430,6 +430,20 @@ class RadioWorker(QtCore.QThread):
         # If we opened a new/different file, we should ensure dedupe structures match.
         # (We reset dedupe when we close with reset_dedupe=True.)
         self.status.emit(f"Logging to {self._csv_path.resolve()}")
+
+    def _next_non_overwriting_csv_path(self, path: Path) -> Path:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return p
+        suffix = p.suffix
+        stem = p.stem or "data"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        candidate = p.with_name(f"{stem}_{ts}{suffix}")
+        idx = 2
+        while candidate.exists():
+            candidate = p.with_name(f"{stem}_{ts}_{idx}{suffix}")
+            idx += 1
+        return candidate
 
     def _close_csv(self, *, reset_dedupe: bool = False) -> None:
         try:

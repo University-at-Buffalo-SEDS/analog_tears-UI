@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -638,6 +639,41 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self.filename_edit.text().strip()
         return name if name else "Data/HTF_Data.csv"
 
+    def _next_non_overwriting_filename(self, filename: str) -> str:
+        path = Path(filename).expanduser()
+        if not path.exists():
+            return str(path)
+        suffix = path.suffix
+        stem = path.stem or "data"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        candidate = path.with_name(f"{stem}_{ts}{suffix}")
+        idx = 2
+        while candidate.exists():
+            candidate = path.with_name(f"{stem}_{ts}_{idx}{suffix}")
+            idx += 1
+        return str(candidate)
+
+    def _ensure_saving_active_for_ignition(self) -> None:
+        if self._saving_active:
+            if self._saving_paused:
+                self._saving_paused = False
+                self.pause_save_btn.blockSignals(True)
+                self.pause_save_btn.setChecked(False)
+                self.pause_save_btn.blockSignals(False)
+                self.pause_saving.emit(False)
+                self._sync_saving_ui()
+            return
+
+        requested = self._get_filename()
+        chosen = self._next_non_overwriting_filename(requested)
+        if chosen != requested:
+            self.filename_edit.setText(chosen)
+        self._saving_active = True
+        self._saving_paused = False
+        self.start_saving.emit(chosen)
+        self.pause_saving.emit(False)
+        self._sync_saving_ui()
+
     def _get_calibration_filename(self) -> str:
         name = self.calib_filename_edit.text().strip()
         return name if name else "loadcell_calibration.json"
@@ -727,7 +763,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # Saving UI callbacks
     # -------------------------------------------------
     def _on_start_saving(self) -> None:
-        fn = self._get_filename()
+        fn = self._next_non_overwriting_filename(self._get_filename())
+        self.filename_edit.setText(fn)
         self._saving_active = True
         self._saving_paused = False
         self.start_saving.emit(fn)
@@ -803,9 +840,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._confirm(
                 "IGNITER ON",
                 "You are about to turn the IGNITER ON.\n\nAre you absolutely sure?",
-            ):
-                self.cmd_status_lbl.setText("Igniter: aborted")
-                return
+                ):
+                    self.cmd_status_lbl.setText("Igniter: aborted")
+                    return
+
+        # Keep telemetry capture running for ignition sequence starts.
+        if on and cmd.upper() == "I":
+            self._ensure_saving_active_for_ignition()
 
         self._send_command(cmd, on)
         self.cmd_status_lbl.setText(f"Sent: {cmd} {'ON' if on else 'OFF'} (waiting...)")

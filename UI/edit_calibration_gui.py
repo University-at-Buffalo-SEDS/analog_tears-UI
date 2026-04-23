@@ -611,6 +611,23 @@ class CalibrationEditor(QtWidgets.QWidget):
         pts.append((raw, kg))
         return "added"
 
+    def _zero_raw_for_channel(self, channel: int) -> float | None:
+        pts = self._points_for_channel(channel)
+        for raw_i, kg_i in pts:
+            if abs(kg_i) < 1e-9:
+                return float(raw_i)
+        return None
+
+    def _shift_nonzero_points_for_channel(self, channel: int, delta_raw: float) -> int:
+        pts = self._points_for_channel(channel)
+        shifted = 0
+        for i, (raw_i, kg_i) in enumerate(pts):
+            if abs(kg_i) < 1e-9:
+                continue
+            pts[i] = (float(raw_i) + float(delta_raw), float(kg_i))
+            shifted += 1
+        return shifted
+
     def _begin_capture(self, channel: int, weight: float, mode: str) -> None:
         if self._raw_sock is None:
             self.status_lbl.setText("Status: no live stream connected")
@@ -679,8 +696,8 @@ class CalibrationEditor(QtWidgets.QWidget):
             self.status_lbl.setText(f"Status: start {self._channel_name(ch)} sequence first (0)")
             return False
         if abs(float(kg)) <= 1e-9:
-            self.status_lbl.setText("Status: expected kg must be non-zero for sequence points")
-            return False
+            self._begin_capture(ch, 0.0, "sequence_zero")
+            return True
         self._begin_capture(ch, float(kg), "sequence_point")
         return True
 
@@ -725,9 +742,16 @@ class CalibrationEditor(QtWidgets.QWidget):
                     f"Status: capturing {self._channel_name(self._capture_channel)} {n}/{self._capture_target} at {self._capture_weight:g}..."
                 )
                 if n >= self._capture_target:
+                    old_zero = None
+                    if self._capture_mode == "sequence_zero":
+                        old_zero = self._zero_raw_for_channel(self._capture_channel)
                     avg = sum(self._capture_vals) / float(n)
                     action = self._upsert_point(self._capture_channel, self._capture_weight, avg)
                     if self._capture_mode == "sequence_zero":
+                        if old_zero is not None:
+                            delta = float(avg) - float(old_zero)
+                            if abs(delta) > 1e-12:
+                                self._shift_nonzero_points_for_channel(self._capture_channel, delta)
                         if self._capture_channel == 0:
                             self.ch0_zero.setText(str(avg))
                         elif self._capture_channel == 1:
