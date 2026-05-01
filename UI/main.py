@@ -165,6 +165,9 @@ class RadioWorker(QtCore.QThread):
     # ----------------------------
     @QtCore.pyqtSlot(str)
     def start_logging(self, filename: str) -> None:
+        if self._logging_enabled:
+            self.status.emit("Saving already active; start ignored")
+            return
         path = self._next_non_overwriting_csv_path(Path(filename))
         self._csv_path = path
         self._open_csv_if_needed()

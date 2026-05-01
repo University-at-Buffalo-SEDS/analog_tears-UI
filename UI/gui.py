@@ -763,6 +763,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # Saving UI callbacks
     # -------------------------------------------------
     def _on_start_saving(self) -> None:
+        if self._saving_active:
+            return
         fn = self._next_non_overwriting_filename(self._get_filename())
         self.filename_edit.setText(fn)
         self._saving_active = True
