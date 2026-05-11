@@ -5,12 +5,14 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
 import argparse
 import signal
 from collections import deque
+from queue import Empty, Queue
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +85,321 @@ def load_calibration(path: Path) -> Optional[Calibration]:
         return None
 
 
+class CsvSpooler:
+    """
+    Dedicated writer thread:
+    - ingests rows from memory queue
+    - batches to SQLite (crash-resilient journal)
+    - incrementally flushes journaled rows to CSV
+    """
+
+    CSV_COLUMNS = [
+        "Rx_Timestamp",
+        "Header",
+        "Seq",
+        "Timestamp",
+        "1000kg Raw",
+        "Tank Pressure Raw",
+        "Battery Voltage",
+        "CRC",
+        "1000kg Calibrated",
+        "Weight",
+        "Thrust",
+        "Tank Pressure Calibrated",
+    ]
+
+    def __init__(self, db_path: Path):
+        self._db_path = Path(db_path)
+        self._q: Queue = Queue()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._active_session_id: Optional[int] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="csv-spooler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._q.put(("shutdown",))
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def cleanup_storage(self) -> None:
+        """
+        Remove spool DB artifacts when there are no unfinished sessions.
+        Leaves files in place if recovery data is still needed.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        if not self._db_path.exists():
+            return
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=2.0)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='sessions';"
+                ).fetchone()
+                has_sessions = bool(row and int(row[0]) > 0)
+                if has_sessions:
+                    unfinished = conn.execute(
+                        "SELECT COUNT(1) FROM sessions WHERE finalized=0;"
+                    ).fetchone()
+                    if unfinished and int(unfinished[0]) > 0:
+                        return
+            finally:
+                conn.close()
+        except Exception:
+            return
+
+        for p in (
+            self._db_path,
+            Path(str(self._db_path) + "-wal"),
+            Path(str(self._db_path) + "-shm"),
+        ):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+    def start_session(self, csv_path: Path) -> None:
+        self._q.put(("start_session", str(Path(csv_path).expanduser())))
+
+    def stop_session(self) -> None:
+        self._q.put(("stop_session",))
+
+    def enqueue_row(self, row: list) -> None:
+        self._q.put(("row", row))
+
+    def recover_pending_sessions(self) -> None:
+        self._q.put(("recover",))
+
+    def flush_now(self) -> None:
+        self._q.put(("flush_now",))
+
+    @staticmethod
+    def _ensure_csv_header(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 0:
+            return
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(CsvSpooler.CSV_COLUMNS)
+            f.flush()
+
+    def _init_db(self, conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=FULL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                csv_path TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                last_flushed_row_id INTEGER NOT NULL DEFAULT 0,
+                finalized INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rows(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                rx_timestamp TEXT NOT NULL,
+                header INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                ts INTEGER NOT NULL,
+                ch1_raw REAL NOT NULL,
+                tank_raw INTEGER NOT NULL,
+                batt_v REAL NOT NULL,
+                crc INTEGER NOT NULL,
+                ch1_cal REAL NOT NULL,
+                weight REAL NOT NULL,
+                thrust REAL NOT NULL,
+                tank_cal REAL NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
+            """
+        )
+        conn.commit()
+
+    def _insert_rows(self, conn: sqlite3.Connection, session_id: int, rows: list[list]) -> None:
+        if not rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO rows(
+                session_id, rx_timestamp, header, seq, ts, ch1_raw, tank_raw, batt_v, crc,
+                ch1_cal, weight, thrust, tank_cal
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            [
+                (
+                    session_id,
+                    str(r[0]),
+                    int(r[1]),
+                    int(r[2]),
+                    int(r[3]),
+                    float(r[4]),
+                    int(r[5]),
+                    float(r[6]),
+                    int(r[7]),
+                    float(r[8]),
+                    float(r[9]),
+                    float(r[10]),
+                    float(r[11]),
+                )
+                for r in rows
+            ],
+        )
+        conn.commit()
+
+    def _flush_session_to_csv(self, conn: sqlite3.Connection, session_id: int) -> None:
+        row = conn.execute(
+            "SELECT csv_path, last_flushed_row_id FROM sessions WHERE id=?;",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        csv_path = Path(row[0])
+        last_flushed = int(row[1] or 0)
+        self._ensure_csv_header(csv_path)
+
+        pending = conn.execute(
+            """
+            SELECT id, rx_timestamp, header, seq, ts, ch1_raw, tank_raw, batt_v, crc, ch1_cal, weight, thrust, tank_cal
+            FROM rows
+            WHERE session_id=? AND id > ?
+            ORDER BY id ASC
+            LIMIT 5000;
+            """,
+            (session_id, last_flushed),
+        ).fetchall()
+        if not pending:
+            return
+
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            for r in pending:
+                w.writerow(r[1:])
+            f.flush()
+
+        new_last = int(pending[-1][0])
+        conn.execute(
+            "UPDATE sessions SET last_flushed_row_id=? WHERE id=?;",
+            (new_last, session_id),
+        )
+        conn.commit()
+
+    def _recover_pending(self, conn: sqlite3.Connection) -> None:
+        pending = conn.execute(
+            "SELECT id FROM sessions WHERE finalized=0 ORDER BY id ASC;"
+        ).fetchall()
+        for (sid,) in pending:
+            while True:
+                before = conn.execute(
+                    "SELECT last_flushed_row_id FROM sessions WHERE id=?;",
+                    (sid,),
+                ).fetchone()
+                if before is None:
+                    break
+                old_last = int(before[0] or 0)
+                self._flush_session_to_csv(conn, sid)
+                after = conn.execute(
+                    "SELECT last_flushed_row_id FROM sessions WHERE id=?;",
+                    (sid,),
+                ).fetchone()
+                if after is None or int(after[0] or 0) == old_last:
+                    break
+            conn.execute(
+                "UPDATE sessions SET finalized=1, ended_at=COALESCE(ended_at, ?) WHERE id=?;",
+                (datetime.now().isoformat(timespec="seconds"), sid),
+            )
+            conn.commit()
+
+    def _run(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._db_path, timeout=5.0)
+        try:
+            self._init_db(conn)
+            self._recover_pending(conn)
+            batch: list[list] = []
+            last_flush = time.monotonic()
+            flush_period_s = 0.25
+            while (not self._stop.is_set()) or (not self._q.empty()) or batch:
+                try:
+                    msg = self._q.get(timeout=0.05)
+                except Empty:
+                    msg = None
+
+                if msg is not None:
+                    kind = msg[0]
+                    if kind == "start_session":
+                        csv_path = Path(msg[1])
+                        rec = conn.execute(
+                            "INSERT INTO sessions(csv_path, started_at) VALUES (?, ?);",
+                            (str(csv_path), datetime.now().isoformat(timespec="seconds")),
+                        )
+                        self._active_session_id = int(rec.lastrowid)
+                        conn.commit()
+                    elif kind == "stop_session":
+                        if self._active_session_id is not None:
+                            sid = self._active_session_id
+                            if batch:
+                                self._insert_rows(conn, sid, batch)
+                                batch.clear()
+                            while True:
+                                before = conn.execute(
+                                    "SELECT last_flushed_row_id FROM sessions WHERE id=?;",
+                                    (sid,),
+                                ).fetchone()
+                                old_last = int(before[0] or 0) if before else 0
+                                self._flush_session_to_csv(conn, sid)
+                                after = conn.execute(
+                                    "SELECT last_flushed_row_id FROM sessions WHERE id=?;",
+                                    (sid,),
+                                ).fetchone()
+                                if after is None or int(after[0] or 0) == old_last:
+                                    break
+                            conn.execute(
+                                "UPDATE sessions SET ended_at=?, finalized=1 WHERE id=?;",
+                                (datetime.now().isoformat(timespec="seconds"), sid),
+                            )
+                            conn.commit()
+                            self._active_session_id = None
+                    elif kind == "row":
+                        if self._active_session_id is not None:
+                            batch.append(msg[1])
+                    elif kind == "recover":
+                        self._recover_pending(conn)
+                    elif kind == "flush_now":
+                        if self._active_session_id is not None and batch:
+                            self._insert_rows(conn, self._active_session_id, batch)
+                            batch.clear()
+                        if self._active_session_id is not None:
+                            self._flush_session_to_csv(conn, self._active_session_id)
+                    elif kind == "shutdown":
+                        pass
+
+                now = time.monotonic()
+                if (now - last_flush) >= flush_period_s:
+                    if self._active_session_id is not None and batch:
+                        self._insert_rows(conn, self._active_session_id, batch)
+                        batch.clear()
+                    if self._active_session_id is not None:
+                        self._flush_session_to_csv(conn, self._active_session_id)
+                    last_flush = now
+        finally:
+            conn.close()
+
+
 class RadioWorker(QtCore.QThread):
     """
     Background serial read loop.
@@ -124,8 +441,15 @@ class RadioWorker(QtCore.QThread):
         self._csv_path: Optional[Path] = None
         self._csv_file = None
         self._csv_writer: Optional[csv.writer] = None
+        self._last_csv_flush_mono = 0.0
+        self._csv_flush_interval_s = 0.25
+        self._spooler = CsvSpooler(Path(__file__).parent / "Data" / "save_spool.db")
         self._raw_stream_enabled = False
         self._ui_emit_in_flight = False
+        self._ui_state: dict = {}
+        self._event_log_path: Optional[Path] = None
+        self._event_log_file = None
+        self._event_log_lock = threading.Lock()
         self._reader_stop = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
         # Unbounded queue: do not silently drop telemetry while saving.
@@ -170,25 +494,43 @@ class RadioWorker(QtCore.QThread):
             return
         path = self._next_non_overwriting_csv_path(Path(filename))
         self._csv_path = path
-        self._open_csv_if_needed()
+        self._open_event_log_for_csv(path)
+        self._spooler.start()
+        self._spooler.recover_pending_sessions()
+        self._spooler.start_session(path)
         self._logging_enabled = True
         self._logging_paused = False
+        self._log_event("info", "saving_start", f"Saving started: {path.resolve()}")
         self.status.emit(f"Saving: ON → {path.resolve()}")
 
     @QtCore.pyqtSlot()
     def stop_logging(self) -> None:
         self._logging_enabled = False
         self._logging_paused = False
+        self._spooler.stop_session()
+        self._spooler.stop()
+        self._spooler.cleanup_storage()
         self._close_csv()
         # Return to low-latency display mode after save sessions end.
         self._csv_path = None
+        self._log_event("info", "saving_stop", "Saving stopped")
+        self._close_event_log()
         self.status.emit("Saving: OFF")
 
     @QtCore.pyqtSlot(bool)
     def set_logging_paused(self, paused: bool) -> None:
         self._logging_paused = bool(paused)
+        self._log_event("info", "saving_paused" if self._logging_paused else "saving_resumed", "")
         if self._logging_enabled:
             self.status.emit("Saving: PAUSED" if self._logging_paused else "Saving: RUNNING")
+
+    @QtCore.pyqtSlot(str)
+    def update_ui_state(self, ui_state_json: str) -> None:
+        try:
+            self._ui_state = json.loads(ui_state_json)
+        except Exception:
+            self._ui_state = {"raw": str(ui_state_json)}
+        self._log_event("info", "ui_state", "")
 
     @QtCore.pyqtSlot(str)
     def save_last_10s(self, filename: str) -> None:
@@ -197,28 +539,50 @@ class RadioWorker(QtCore.QThread):
         without duplicating rows already written to the same file.
         """
         path = Path(filename)
-        # Switch target file for snapshot (if different)
-        if self._csv_path != path:
-            # close old file; dedupe resets per-file (safer + expected)
-            self._logging_enabled = False
-            self._close_csv(reset_dedupe=True)
-            self._csv_path = path
-
-        self._open_csv_if_needed()
+        was_logging = bool(self._logging_enabled)
+        active_path = self._csv_path
 
         now = time.monotonic()
         cutoff = now - 10.0
         rows = [br for br in self._recent if br.t_mono >= cutoff]
 
         wrote = 0
-        for br in rows:
-            if self._write_row_dedup(br.key, br.row):
-                wrote += 1
-
-        # Snapshot writes should not force persistent non-display-only mode.
-        if not self._logging_enabled:
-            self._close_csv()
-            self._csv_path = None
+        if was_logging and active_path is not None and Path(active_path) != path:
+            # While continuous saving is active, snapshots to a different file
+            # must never mutate active logging state.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            new_file = (not path.exists()) or (path.stat().st_size == 0)
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow([
+                        "Rx_Timestamp",
+                        "Header",
+                        "Seq",
+                        "Timestamp",
+                        "1000kg Raw",
+                        "Tank Pressure Raw",
+                        "Battery Voltage",
+                        "CRC",
+                        "1000kg Calibrated",
+                        "Weight",
+                        "Thrust",
+                        "Tank Pressure Calibrated",
+                    ])
+                for br in rows:
+                    w.writerow(br.row)
+                    wrote += 1
+                f.flush()
+        else:
+            # Snapshot to active file (or while not actively logging): keep dedupe behavior.
+            self._csv_path = path
+            self._open_csv_if_needed()
+            for br in rows:
+                if self._write_row_dedup(br.key, br.row):
+                    wrote += 1
+            if not was_logging:
+                self._close_csv()
+                self._csv_path = active_path
 
         self.status.emit(f"Saved last 10s: wrote {wrote} row(s) → {path.resolve()}")
 
@@ -295,12 +659,6 @@ class RadioWorker(QtCore.QThread):
             self.status.emit("Calibration: not loaded (using defaults)")
         else:
             self.status.emit("Calibration: loaded")
-            if self._logging_enabled:
-                try:
-                    self._open_csv_if_needed()
-                    self._write_calibration_row()
-                except Exception as e:
-                    self.status.emit(f"Calibration CSV write error: {e}")
 
     @QtCore.pyqtSlot(bool)
     def set_raw_stream_enabled(self, enabled: bool) -> None:
@@ -411,6 +769,7 @@ class RadioWorker(QtCore.QThread):
         new_file = not self._csv_path.exists() or self._csv_path.stat().st_size == 0
         self._csv_file = open(self._csv_path, "a", newline="")
         self._csv_writer = csv.writer(self._csv_file)
+        self._last_csv_flush_mono = time.monotonic()
 
         if new_file:
             self._csv_writer.writerow([
@@ -448,6 +807,55 @@ class RadioWorker(QtCore.QThread):
             idx += 1
         return candidate
 
+    def _open_event_log_for_csv(self, csv_path: Path) -> None:
+        p = Path(csv_path).expanduser()
+        log_path = p.with_name(f"{p.name}.events.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._event_log_path = log_path
+        with self._event_log_lock:
+            if self._event_log_file is not None:
+                try:
+                    self._event_log_file.close()
+                except Exception:
+                    pass
+            self._event_log_file = open(log_path, "a", encoding="utf-8")
+        self._log_event("info", "log_open", f"Event log opened: {log_path.resolve()}")
+
+    def _close_event_log(self) -> None:
+        with self._event_log_lock:
+            if self._event_log_file is None:
+                return
+            try:
+                self._event_log_file.flush()
+                self._event_log_file.close()
+            except Exception:
+                pass
+            self._event_log_file = None
+
+    def _log_event(self, level: str, event: str, message: str, extra: Optional[dict] = None) -> None:
+        with self._event_log_lock:
+            if self._event_log_file is None:
+                return
+            rec = {
+                "ts": datetime.now().isoformat(timespec="milliseconds"),
+                "level": str(level),
+                "event": str(event),
+                "message": str(message),
+                "save_state": {
+                    "enabled": bool(self._logging_enabled),
+                    "paused": bool(self._logging_paused),
+                    "csv_path": str(self._csv_path) if self._csv_path is not None else None,
+                },
+                "ui_state": self._ui_state,
+            }
+            if extra:
+                rec["extra"] = extra
+            try:
+                self._event_log_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                self._event_log_file.flush()
+            except Exception:
+                pass
+
     def _close_csv(self, *, reset_dedupe: bool = False) -> None:
         try:
             if self._csv_file is not None:
@@ -473,10 +881,7 @@ class RadioWorker(QtCore.QThread):
 
         # write
         self._csv_writer.writerow(row)
-        try:
-            self._csv_file.flush()
-        except Exception:
-            pass
+        self._flush_csv_if_due()
 
         # record
         self._written_keys.append(key)
@@ -488,6 +893,25 @@ class RadioWorker(QtCore.QThread):
             self._written_set = set(self._written_keys)
 
         return True
+
+    def _write_row(self, row: list) -> bool:
+        if self._csv_writer is None:
+            return False
+        self._csv_writer.writerow(row)
+        self._flush_csv_if_due()
+        return True
+
+    def _flush_csv_if_due(self, *, force: bool = False) -> None:
+        if self._csv_file is None:
+            return
+        now = time.monotonic()
+        if (not force) and ((now - self._last_csv_flush_mono) < self._csv_flush_interval_s):
+            return
+        try:
+            self._csv_file.flush()
+            self._last_csv_flush_mono = now
+        except Exception:
+            pass
 
     def _format_calib_value(self, m: Optional[float], b: Optional[float]) -> str:
         if m is None or b is None:
@@ -520,10 +944,7 @@ class RadioWorker(QtCore.QThread):
             "",
         ]
         self._csv_writer.writerow(row)
-        try:
-            self._csv_file.flush()
-        except Exception:
-            pass
+        self._flush_csv_if_due(force=True)
 
     def _calibrate_channels(self, _ch0_raw: float, ch1_raw: float) -> tuple[float, float]:
         # Ch0 (legacy 50kg) is ignored by design. Keep API shape for GUI compatibility.
@@ -570,12 +991,14 @@ class RadioWorker(QtCore.QThread):
         last_status = ""
         last_ui_emit = 0.0
         last_raw_emit = 0.0
-        ui_emit_period = 1.0 / 240.0
+        ui_emit_period = 1.0 / 120.0
         raw_emit_period = 1.0 / 120.0
         rate_period = 0.25
         last_rate_emit = time.monotonic()
         prev_ingress_packets = 0
         prev_ingress_bytes = 0
+        last_pkt_rate = 0.0
+        last_byte_rate = 0.0
         crc_verify_enabled = True
         seen_igniter_command = False
         turn_p_off = False
@@ -585,7 +1008,10 @@ class RadioWorker(QtCore.QThread):
         no_data_reconnect_s = 0.75
         last_rx_item_mono = time.monotonic()
         last_no_data_status = 0.0
+        last_log_heartbeat = time.monotonic()
 
+        self._spooler.start()
+        self._spooler.recover_pending_sessions()
         self._start_reader_thread()
 
         try:
@@ -607,6 +1033,7 @@ class RadioWorker(QtCore.QThread):
                     new_status = "Reconnected" if ok else "Disconnected (retrying...)"
                     if new_status != last_status:
                         self.status.emit(new_status)
+                        self._log_event("warning" if not ok else "info", "link_status", new_status)
                         last_status = new_status
                     if last_link_state is not bool(ok):
                         self.link_state.emit(bool(ok))
@@ -618,6 +1045,7 @@ class RadioWorker(QtCore.QThread):
                         dropped_total = dropped_os + dropped_rx + dropped_events + dropped_latest
                         if dropped_total > 0:
                             self.status.emit(f"Reconnect sync: dropped {dropped_total} stale item(s)")
+                            self._log_event("info", "reconnect_sync", f"dropped={dropped_total}")
                         now_ok = time.monotonic()
                         # Short grace window uses aggressive low-latency trimming in reader loop.
                         self._post_reconnect_grace_until = now_ok + 0.4
@@ -650,6 +1078,7 @@ class RadioWorker(QtCore.QThread):
                     if (now - last_rx_item_mono) >= no_data_reconnect_s:
                         if (now - last_no_data_status) >= 1.0:
                             self.status.emit("No data (forcing reconnect...)")
+                            self._log_event("warning", "no_data_reconnect", "No data, forcing reconnect")
                             last_no_data_status = now
                         try:
                             self.radio.close()
@@ -740,6 +1169,7 @@ class RadioWorker(QtCore.QThread):
                         )
                     except Exception as e:
                         self.status.emit(f"Packet->CSV error: {e}")
+                        self._log_event("error", "packet_to_csv_error", str(e))
                         continue
 
                     # Buffer for snapshots
@@ -748,10 +1178,10 @@ class RadioWorker(QtCore.QThread):
                     # CSV output (if enabled)
                     if self._logging_enabled and (not self._logging_paused):
                         try:
-                            self._open_csv_if_needed()
-                            self._write_row_dedup(key, row)
+                            self._spooler.enqueue_row(row)
                         except Exception as e:
                             self.status.emit(f"CSV write error: {e}")
+                            self._log_event("error", "csv_write_error", str(e))
 
                 # GUI update
                 try:
@@ -767,10 +1197,11 @@ class RadioWorker(QtCore.QThread):
                         self.raw_sample.emit(float(ui_t_mono), 0.0, ch1_raw_ui, float(ui_packet.internal_adc))
                         last_raw_emit = ui_t_mono
 
-                    if (ui_t_mono - last_ui_emit) >= ui_emit_period:
+                    if ((ui_t_mono - last_ui_emit) >= ui_emit_period) and (not self._ui_emit_in_flight):
                         _, ch1_cal = self._calibrate_channels(0.0, ch1_raw_ui)
                         tank_pressure = self._calibrate_tank_pressure(float(ui_packet.internal_adc))
                         batt_v = float(ui_packet.battery_voltage)
+                        self._ui_emit_in_flight = True
                         self.sample.emit(
                             float(ui_t_mono),
                             0.0,
@@ -783,6 +1214,7 @@ class RadioWorker(QtCore.QThread):
                         last_ui_emit = ui_t_mono
                 except Exception as e:
                     self.status.emit(f"Emit error: {e}")
+                    self._log_event("error", "emit_error", str(e))
 
                 now_rate = time.monotonic()
                 dt_rate = now_rate - last_rate_emit
@@ -790,13 +1222,35 @@ class RadioWorker(QtCore.QThread):
                     ingress_packets, ingress_bytes = self._take_ingress_totals()
                     pkt_rate = float(ingress_packets - prev_ingress_packets) / dt_rate
                     byte_rate = float(ingress_bytes - prev_ingress_bytes) / dt_rate
+                    last_pkt_rate = pkt_rate
+                    last_byte_rate = byte_rate
                     prev_ingress_packets = ingress_packets
                     prev_ingress_bytes = ingress_bytes
                     self.data_rate.emit(byte_rate, pkt_rate)
                     last_rate_emit = now_rate
+                if self._logging_enabled and ((now_rate - last_log_heartbeat) >= 1.0):
+                    self._log_event(
+                        "info",
+                        "save_heartbeat",
+                        "",
+                        extra={"ingress_packets": int(prev_ingress_packets), "pkt_rate": float(last_pkt_rate), "byte_rate": float(last_byte_rate)},
+                    )
+                    last_log_heartbeat = now_rate
 
         finally:
             self._reader_stop.set()
+            try:
+                self._spooler.stop_session()
+            except Exception:
+                pass
+            try:
+                self._spooler.stop()
+            except Exception:
+                pass
+            try:
+                self._spooler.cleanup_storage()
+            except Exception:
+                pass
             if self._reader_thread is not None:
                 try:
                     self._reader_thread.join(timeout=1.0)
@@ -810,6 +1264,8 @@ class RadioWorker(QtCore.QThread):
             self._close_csv()
             if last_link_state is not False:
                 self.link_state.emit(False)
+            self._log_event("info", "worker_shutdown", "Radio worker shutting down")
+            self._close_event_log()
             self.status.emit("Radio closed.")
 
 
@@ -898,6 +1354,7 @@ def main():
     win.calibration_saved.connect(worker.reload_calibration, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.raw_stream_enabled.connect(worker.set_raw_stream_enabled, type=QtCore.Qt.ConnectionType.QueuedConnection)
     win.sample_consumed.connect(worker.on_ui_sample_consumed, type=QtCore.Qt.ConnectionType.QueuedConnection)
+    win.ui_state_changed.connect(worker.update_ui_state, type=QtCore.Qt.ConnectionType.QueuedConnection)
 
     # initial filename in GUI
     win.set_filename(default_csv_filename)

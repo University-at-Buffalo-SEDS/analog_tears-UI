@@ -276,6 +276,7 @@ class MainWindow(QtWidgets.QMainWindow):
     raw_stream_enabled = QtCore.pyqtSignal(bool)
     sample_consumed = QtCore.pyqtSignal()
     display_raw_values = QtCore.pyqtSignal(bool)
+    ui_state_changed = QtCore.pyqtSignal(str)
 
     def __init__(
         self,
@@ -563,6 +564,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_status_lbl = QtWidgets.QLabel("Saving: OFF")
         self.save_status_lbl.setMinimumWidth(260)
         save_row.addWidget(self.save_status_lbl)
+        self.save_indicator_lbl = QtWidgets.QLabel("REC: OFF")
+        self.save_indicator_lbl.setMinimumWidth(90)
+        self.save_indicator_lbl.setStyleSheet("color: #8b0000; font-weight: 700;")
+        save_row.addWidget(self.save_indicator_lbl)
 
         # -------------------------------------------------
         # Calibration row
@@ -717,6 +722,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.save_last10_btn.setEnabled(False)
             self.save_last10_btn.setText("Save last 10s")
             self.save_status_lbl.setText("Saving: OFF")
+            self.save_indicator_lbl.setText("REC: OFF")
+            self.save_indicator_lbl.setStyleSheet("color: #8b0000; font-weight: 700;")
         else:
             fn = self._get_filename()
             if self._saving_paused:
@@ -725,11 +732,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 # NEW: button text indicates it resumes saving too
                 self.save_last10_btn.setText("Save + Resume (10s)")
                 self.pause_save_btn.setText("Resume saving")
+                self.save_indicator_lbl.setText("REC: PAUSE")
+                self.save_indicator_lbl.setStyleSheet("color: #b8860b; font-weight: 700;")
             else:
                 self.save_status_lbl.setText(f"Saving: ON → {fn}")
                 self.save_last10_btn.setEnabled(False)
                 self.save_last10_btn.setText("Save last 10s")
                 self.pause_save_btn.setText("Pause saving")
+                self.save_indicator_lbl.setText("REC: ON")
+                self.save_indicator_lbl.setStyleSheet("color: #0a7a20; font-weight: 700;")
+        self._emit_ui_state()
+
+    def _emit_ui_state(self) -> None:
+        state = {
+            "saving_active": bool(self._saving_active),
+            "saving_paused": bool(self._saving_paused),
+            "display_paused": bool(self._paused),
+            "filename": self._get_filename(),
+            "link_connected": bool(self._link_connected),
+            "show_raw_values": bool(self._show_raw_values),
+            "window_seconds": float(self._window_seconds),
+        }
+        try:
+            self.ui_state_changed.emit(json.dumps(state, separators=(",", ":")))
+        except Exception:
+            pass
 
     # -------------------------------------------------
     # Guards
@@ -860,6 +887,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # display pause only (does NOT affect saving)
         self._paused = checked
         self.pause_btn.setText("Resume" if checked else "Pause")
+        self._emit_ui_state()
 
     def _on_window_changed(self, value: int) -> None:
         self._window_seconds = float(value)
@@ -1156,6 +1184,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Prevent disconnected-era extrapolation from affecting reconnect.
             self._last_real_sample = None
             self._prev_real_sample = None
+        self._emit_ui_state()
 
     # -------------------------------------------------
     # Data entry
