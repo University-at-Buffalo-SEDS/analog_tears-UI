@@ -313,7 +313,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prev_real_sample: Optional[tuple[float, float, float, float, float, float, float]] = None
         self._show_raw_values = False
         self._active_calib_dialog: Optional[_CalibrationDialog] = None
-        self._load_plot_min_half_span = 25.0
+        self._load_plot_min_half_span = 0.0
 
         # Filter settings
         self._default_filter_enabled = False
@@ -1145,7 +1145,7 @@ class MainWindow(QtWidgets.QMainWindow):
         xs, y0, y1, y2, y3 = self._get_active_series()
         load_xs, load_y = self._get_active_load_series()
         load_peak = max((abs(v) for v in load_y), default=0.0)
-        load_full = max(float(self._load_plot_min_half_span), float(load_peak), 1.0)
+        load_full = max(float(self._load_plot_min_half_span), float(load_peak), 0.1)
         self.p_load.setYRange(-load_full, load_full, padding=0.02)
         self.p_load.getAxis("left").setTicks([[
             (-load_full, f"{-load_full:.1f}"),
