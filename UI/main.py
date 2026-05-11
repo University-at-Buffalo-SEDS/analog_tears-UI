@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Deque
+from _csv import writer as csv_writer_type
 
 from PyQt6 import QtCore, QtWidgets
 
@@ -440,7 +441,7 @@ class RadioWorker(QtCore.QThread):
         self._logging_paused = False
         self._csv_path: Optional[Path] = None
         self._csv_file = None
-        self._csv_writer: Optional[csv.writer] = None
+        self._csv_writer: Optional[csv_writer_type] = None
         self._last_csv_flush_mono = 0.0
         self._csv_flush_interval_s = 0.25
         self._spooler = CsvSpooler(Path(__file__).parent / "Data" / "save_spool.db")
